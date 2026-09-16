@@ -6810,6 +6810,47 @@
   window.__renameAccount = (from, to, opts) => renameAccount(from, to, opts);
   window.__dbgIsSuperAdmin = (name) => isSuperAdminName(name);
   window.__dbgSuperAdmins = () => SUPER_ADMINS.slice();
+  /**
+   * 成员列表为什么看不见人？在控制台执行 textdbDiag() 即可自检。
+   * 管理端的成员名单有 3 个来源：账号表(USERS_KEY)、各用户索引桶、以及自己。
+   * 只要账号表这一次读取失败，loadUsers() 会「静默」返回空数组 —— 已注册但还没
+   * 传过文件的用户就全部消失，而且界面上看不出任何报错。这里把真实原因问出来。
+   */
+  window.textdbDiag = async () => {
+    const out = {
+      version: 'su-v2',
+      当前用户: session.user,
+      算管理员: canManage(),
+      算超级管理员: isSuperAdminName(),
+      数据桶: myKey(),
+      云端账号表键: USERS_KEY
+    };
+    // 1) 账号表能不能读到（关键）
+    try {
+      const raw = await textdbGet(USERS_KEY);
+      out.账号表读取 = '成功';
+      out.账号表原始长度 = String(raw || '').length;
+      let list = [];
+      try { list = raw ? JSON.parse(raw) : []; } catch (e) { out.账号表解析 = '失败：' + e.message; }
+      out.账号表人数 = Array.isArray(list) ? list.length : 0;
+      out.账号表用户名 = Array.isArray(list) ? list.map((u) => u && u.user).filter(Boolean) : [];
+    } catch (e) {
+      out.账号表读取 = '失败：' + e.message;
+      out.诊断 = '账号表读不到 —— 成员名单缺的就是这一块（索引里有文件的人仍会显示）';
+    }
+    // 2) 界面侧拿到的人数
+    try { out.界面已知用户 = (window.__shellState ? window.__shellState().knownUsers : null) || []; }
+    catch (e) { out.界面已知用户 = '读取失败'; }
+    // 3) 索引里实际出现过的用户名
+    try {
+      out.索引内用户名 = Array.from(new Set((window.__dbgAllIndex() || [])
+        .map((it) => String(it.owner || '').trim()).filter(Boolean)));
+    } catch (e) { out.索引内用户名 = '读取失败'; }
+    // 4) 内置超管名单（运行时解码结果）
+    try { out.内置超管 = SUPER_ADMINS.slice(); } catch (e) {}
+    console.log('【TextDB 诊断】', out);
+    return out;
+  };
   window.__dbgConcurrency = () => concurrency();
   window.__dbgUploading = () => isUploading;
   window.__dbgDownloading = () => isDownloading;
@@ -11098,6 +11139,16 @@
       openWin('explorer');
       try { window.renderFileList(); } catch (e) {}
     };
+    /**
+     * 只读快照，给 textdbDiag() 用：成员名单来自云端账号表，
+     * 拿不到时这一层是空的，诊断必须能看到它才能区分「账号表没读到」和「渲染没刷」。
+     */
+    window.__shellState = () => ({
+      knownUsers: (state.knownUsers || []).slice(),
+      canManage: !!V().canManage,
+      adminUserFilter: state.adminUserFilter || null,
+      memberRows: document.querySelectorAll('.list-row[data-member]').length
+    });
     window.__shellOnLogout = function () {
       closeWin('explorer');
       closeWin('preview');
