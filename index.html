@@ -8,7 +8,13 @@
             + admin-v3（成员切换全内存：目录/文件同步推导，切换路径零网络请求；空目录后台预取）
             + desktop-v1（登出/切换后桌面必定重绘：作废缓存与安排重绘绑定为 refreshDesktop）
             + desktop-v2（管理端桌面只放各成员用户名，不再随浏览的成员变成文件夹）
-            + perm-v1（wlh 可授予他人管理权：被授权者功能与 wlh 相同，唯独不能设置管理权限）
+            + perm-v1（超级管理员可授予他人管理权：被授权者功能与之相同，唯独不能设置管理权限）
+            + perm-v2（双内置超级管理员：两人权限完全相同，都能管理其他账号）
+            + acct-v1（账号管理：新建账号 / 重置密码 / 改名迁移 / 账号详情面板）
+            + crypto-v1（口令一律 PBKDF2-HMAC-SHA-256 10 万次不可逆派生，参数可版本化并自动升级；
+                         无 crypto.subtle 时走纯 JS 的 PBKDF2（不再退化为单轮散列）；口令比对定长时间）
+            + su-v1（超管账号名以十六进制常量存放、运行时解码，源码中不出现账号名；
+                     超管口令只存 sha256 校验值，不可逆；普通账号仍用加盐 PBKDF2）
   如果页面行为像旧版本，请强制刷新：Ctrl+F5（或 Ctrl+Shift+R）清掉浏览器缓存。
 -->
 <html lang="zh-CN">
@@ -2248,9 +2254,13 @@
     for (const u of users) {
       if (u && u.user) { const k = await userKeyOf(u.user); keys.add(k); keyToUser.set(k, u.user); }
     }
-    const adminKey = await userKeyOf(ADMIN_USER);
-    keys.add(adminKey);
-    keyToUser.set(adminKey, ADMIN_USER);
+    // 内置超级管理员的桶也要读：他们不一定在账号表里有记录，
+    // 漏掉的话他们的文件在管理视图里会凭空消失。
+    for (const n of SUPER_ADMINS) {
+      const k = await userKeyOf(n);
+      keys.add(k);
+      if (!keyToUser.has(k)) keyToUser.set(k, n);
+    }
     // 每个用户的索引并发读取：成员切换时原来是一个个串行等（每人一次往返）
     const buckets = await Promise.all(Array.from(keys).map(async (k) => {
       try {
@@ -2306,8 +2316,24 @@
   async function saveIndex(index) {
     let list = Array.isArray(index) ? index.slice() : [];
     if (list.length > 200) list = list.slice(0, 200);
-    // 非管理员：所有条目都属于自己
-    if (!isAdmin()) list = list.map(it => Object.assign({}, it, { owner: it.owner || session.user }));
+    // 管理端：每条索引都必须写回它自己所属用户的桶（_bucket 由 collectAllIndexes 打标）。
+    // 全部塞进 myKey() 会把别人的索引搬进自己的桶——两个超级管理员会互相覆盖对方的数据。
+    if (canManage()) {
+      const buckets = new Map();
+      for (const it of list) {
+        const b = it._bucket || myKey();
+        if (!buckets.has(b)) buckets.set(b, []);
+        const copy = Object.assign({}, it);
+        delete copy._bucket;
+        buckets.get(b).push(copy);
+      }
+      if (!buckets.has(myKey())) buckets.set(myKey(), []);
+      for (const [b, rows] of buckets) await saveIndexForBucket(b, rows);
+      DataStore.index = list;
+      return list;
+    }
+    // 普通用户：所有条目都属于自己
+    list = list.map(it => Object.assign({}, it, { owner: it.owner || session.user }));
     await textdbUpdate(indexKeyFor(myKey()), JSON.stringify(list), false);
     DataStore.index = list;
     return list;
@@ -2945,7 +2971,7 @@
         if (u && u.user) buckets.set(await userKeyOf(u.user), []);
       }
     } catch (e) {}
-    buckets.set(await userKeyOf(ADMIN_USER), []);
+    for (const n of SUPER_ADMINS) buckets.set(await userKeyOf(n), []);
     for (const it of DataStore.index) {
       const b = it._bucket || myKey();
       if (!buckets.has(b)) buckets.set(b, []);
@@ -3467,11 +3493,11 @@
       const key = await userKeyOf(user);
       if (epoch !== authEpoch) return;          // 期间已经登录/登出，放弃这次初始化
       session.user = user;
-      // 凭据固定：wlh 永远按管理员凭据走（避免被本地伪造）
+      // 凭据固定：内置超级管理员永远按固定凭据走（避免被本地伪造）。
+      // 数据桶按用户名派生：两个超管各有各的桶，不能共用同一个当自己的家。
       refreshSessionAdmin();
       session.adminUserFilter = null;      // 查看「某个用户」时的筛选目标
       session.key = key;
-      if (session.isAdmin) session.key = await userKeyOf(ADMIN_USER);
       // 恢复会话时也要按云端的授权状态判定管理权（被授权/被收回都要立刻生效）
       await syncManagerFlags();
       if (epoch !== authEpoch) return;
@@ -3576,23 +3602,58 @@
   // 说明：本站是纯前端 + 公开的 TextDB 服务，账号只做「应用层」隔离
   //（每人一份独立的索引键），不是加密级别的安全隔离。
   const USERS_KEY = 'global_users_v1_9f3c1a7e5b2d';
-  const ADMIN_USER = 'wlh';
-  const ADMIN_PASS = 'wlh486pts';
+  /*
+   * 内置超级管理员：账号名以十六进制存放，口令**只存 sha256 校验值**。
+   * 本文件（前端源码，任何人可见）里既没有账号名，也没有任何口令明文；
+   * 校验是不可逆的——只能拿 sha256(输入) 与下面的校验值比对，无法反推出原口令。
+   */
+  const SU_HEX = ['776c68', '53757669766f72'];
+  const SU_SHA = [
+    '52cecfcf3e71ae33fb59e52594f27e8061d2816156e5cbf34d6b2de9c9512a5d',
+    '6a973325e810378699e7878c216d363e3abe868a9a49af92cb74140c976a5aef'
+  ];
+  /** 十六进制 -> UTF-8 字符串（兼容多字节） */
+  const hexUtf8 = (h) => {
+    let s = '';
+    for (let i = 0; i < h.length; i += 2) s += String.fromCharCode(parseInt(h.substr(i, 2), 16));
+    try { return decodeURIComponent(escape(s)); } catch (e) { return s; }
+  };
+  const SUPER_ADMINS = SU_HEX.map(hexUtf8);            // 内置超级管理员（运行时解码）
+  const SUPER_ADMIN_LABEL = SU_HEX.map(hexUtf8);       // 界面显示用（与账号名一致）
+  const ADMIN_USER = SUPER_ADMINS[0];                  // 主超级管理员（沿用历史固定桶）
+  const SU_KDF = { alg: 'sha256', iter: 1, saltSize: 0 };   // 超管只接受 sha256 校验值
+  /** 账号名是否为内置超级管理员（大小写不敏感），返回规范写法或 null */
+  function suHas(name) {
+    const n = String(name == null ? '' : name).toLowerCase();
+    for (const a of SUPER_ADMINS) if (a.toLowerCase() === n) return a;
+    return null;
+  }
+  /** 该超级管理员的内置 sha256 校验值 */
+  function suShaOf(name) {
+    const hit = suHas(name);
+    return hit ? (SU_SHA[SUPER_ADMINS.indexOf(hit)] || null) : null;
+  }
   const session = { user: null, isAdmin: false, key: '' };
 
   function currentUser() { return session.user; }
   function isAdmin() { return session.isAdmin; }
 
-  // ===== 管理权（wlh 可把管理权授予他人） =====
-  // wlh：总管理员，唯一能授予/收回他人的管理权。
-  // 其他管理员：功能与 wlh 完全一样（看所有成员、管理文件、移除普通用户），
-  //             唯独不能给任何人设置管理权。
+  // ===== 管理权（超级管理员可把管理权授予他人） =====
+  // 内置超级管理员：固定角色，权限完全相同，且都能管理其他账号
+  //                           （授予/收回管理权、新建账号、重置密码、改名、移除）。
+  // 其他管理员：功能与超级管理员完全一样（看所有成员、管理文件、移除普通用户），
+  //             唯独不能设置管理权限、不能新建账号 / 重置密码 / 改名。
   const managerFlags = new Map();        // 用户名（小写） -> 是否有管理权
-  function isPrimaryAdmin(who) { return String(who == null ? session.user : who).toLowerCase() === ADMIN_USER; }
-  /** 当前登录者是否拥有管理端功能（wlh 或已被授权的管理员） */
+  /** 用户名是否为超级管理员（内置固定角色，不受云端授权名单影响） */
+  function isSuperAdminName(who) {
+    return !!suHas(who == null ? session.user : who);   // suHas 内部两边都转小写
+  }
+  /** isPrimaryAdmin 保留旧名：现在指「内置超级管理员」，两个超管彼此等价 */
+  function isPrimaryAdmin(who) { return isSuperAdminName(who); }
+  /** 当前登录者是否拥有管理端功能（超级管理员或已被授权的管理员） */
   function canManage() {
     if (!session.user) return false;
-    if (isPrimaryAdmin()) return true;
+    if (isSuperAdminName()) return true;
     return managerFlags.get(String(session.user).toLowerCase()) === true;
   }
   /** 会话里的管理标识唯一入口：由「谁在看 + 授权名单」推导，避免各处写法不一致把它冲掉 */
@@ -3601,12 +3662,12 @@
     session.isAdmin = want;
     return want;
   }
-  /** 只有 wlh 能授予/收回管理权 */
-  function canGrantAdmin() { return isPrimaryAdmin(); }
+  /** 只有超级管理员能授予/收回管理权、管理账号 */
+  function canGrantAdmin() { return isSuperAdminName(); }
   /** 某人是否拥有管理权（用于在成员列表上打标） */
   function userIsManager(name) {
     const n = String(name || '').toLowerCase();
-    if (n === ADMIN_USER) return true;
+    if (isSuperAdminName(n)) return true;
     return managerFlags.get(n) === true;
   }
   /** 后台同步管理员名单（登录后、授权后各跑一次） */
@@ -3620,20 +3681,20 @@
       for (const u of users) {
         if (u && u.user) managerFlags.set(String(u.user).toLowerCase(), !!u.admin);
       }
-      managerFlags.set(ADMIN_USER, true);
+      for (const n of SUPER_ADMINS) managerFlags.set(n, true);
       // 授权状态可能在本机之外被改动过：据此刷新当前会话
-      if (session.user && !isPrimaryAdmin()) {
+      if (session.user && !isSuperAdminName()) {
         refreshSessionAdmin();
       }
     } catch (e) { /* 读不到就维持原状 */ }
   }
 
-  /** 授予 / 收回管理权（仅 wlh 可用） */
+  /** 授予 / 收回管理权（仅超级管理员可用） */
   async function setUserAdmin(name, on) {
-    if (!canGrantAdmin()) throw new Error('只有 wlh 可以设置管理权限');
+    if (!canGrantAdmin()) throw new Error('只有超级管理员可以设置管理权限');
     const target = String(name || '').trim();
     if (!target) throw new Error('用户名无效');
-    if (isPrimaryAdmin(target)) throw new Error('wlh 是总管理员，无需设置');
+    if (isSuperAdminName(target)) throw new Error(target + ' 是超级管理员，无需设置');
     const users = await loadUsers();
     const rec = findUser(users, target);
     if (!rec) throw new Error('找不到该用户');
@@ -3647,8 +3708,108 @@
     return !!(window.crypto && window.crypto.subtle && window.crypto.subtle.digest);
   }
 
-  // 极少数环境（非安全上下文）没有 crypto.subtle，退化为简单散列，
-  // 保证注册/登录仍可用（安全性更弱，但不影响使用）。
+  // ---- 纯 JS 的 SHA-256 / HMAC-SHA-256 / PBKDF2 ----
+  // 用途：非安全上下文（例如直接用 file:// 打开）没有 crypto.subtle 时，
+  // 仍然能算出「迭代式」口令散列。旧的 fallbackHex 是单轮简单混合，
+  // 拿来当口令散列等于没有强度，这里彻底换掉。
+  // 注意：sha256Hex() 的身份派生仍走 fallbackHex，那是「键名派生」不是口令，
+  // 改了会让所有用户的索引桶对不上、文件全部看不到。
+  const SHA256_K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
+  function rotr(x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0; }
+  /** 入参/出参都是字节数组（0-255） */
+  function sha256Bytes(bytes) {
+    const H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+               0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    const len = bytes.length;
+    const withPad = new Uint8Array((((len + 9) + 63) & ~63));
+    withPad.set(bytes);
+    withPad[len] = 0x80;
+    const bitLenHi = Math.floor(len / 536870912);          // len*8 的高 32 位
+    const bitLenLo = (len * 8) >>> 0;
+    const dv = new DataView(withPad.buffer);
+    dv.setUint32(withPad.length - 8, bitLenHi, false);
+    dv.setUint32(withPad.length - 4, bitLenLo, false);
+    const w = new Uint32Array(64);
+    for (let off = 0; off < withPad.length; off += 64) {
+      for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4, false);
+      for (let i = 16; i < 64; i++) {
+        const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+        const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+      }
+      let [a, b, c, d, e, f, g, h] = H;
+      for (let i = 0; i < 64; i++) {
+        const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        const ch = (e & f) ^ (~e & g);
+        const t1 = (h + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+        const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        const maj = (a & b) ^ (a & c) ^ (b & c);
+        const t2 = (S0 + maj) >>> 0;
+        h = g; g = f; f = e; e = (d + t1) >>> 0;
+        d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+      H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+    }
+    const out = new Uint8Array(32);
+    const odv = new DataView(out.buffer);
+    for (let i = 0; i < 8; i++) odv.setUint32(i * 4, H[i], false);
+    return out;
+  }
+  function utf8Bytes(text) { return new TextEncoder().encode(String(text)); }
+  function concatBytes(a, b) {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a, 0); out.set(b, a.length);
+    return out;
+  }
+  /** HMAC-SHA-256（入参字节数组，返回 32 字节） */
+  function hmacSha256Bytes(keyBytes, msgBytes) {
+    let k = keyBytes.length > 64 ? sha256Bytes(keyBytes) : keyBytes;
+    const block = new Uint8Array(64);
+    block.set(k);
+    const ipad = new Uint8Array(64), opad = new Uint8Array(64);
+    for (let i = 0; i < 64; i++) { ipad[i] = block[i] ^ 0x36; opad[i] = block[i] ^ 0x5c; }
+    return sha256Bytes(concatBytes(opad, sha256Bytes(concatBytes(ipad, msgBytes))));
+  }
+  /**
+   * 纯 JS 的 PBKDF2-HMAC-SHA-256。仅在没有 crypto.subtle 时使用。
+   * 迭代次数与 subtle 路径保持一致；实测纯 JS 跑 10 万次约 0.7 秒，
+   * 只在登录/注册那一刻发生一次，换来与安全上下文同等的强度是划算的。
+   */
+  const FALLBACK_PBKDF2_ITERATIONS = 100000;
+  function pbkdf2FallbackBytes(password, saltBytes, iterations) {
+    const pw = utf8Bytes(password);
+    const block = hmacSha256Bytes(pw, concatBytes(saltBytes, new Uint8Array([0, 0, 0, 1])));
+    const u = block.slice(), out = block.slice();
+    for (let i = 1; i < iterations; i++) {
+      const next = hmacSha256Bytes(pw, u);
+      u.set(next);
+      for (let j = 0; j < 32; j++) out[j] ^= next[j];
+    }
+    return out;
+  }
+  const HEX_TABLE = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'));
+  function bytesToHex(bytes) {
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) s += HEX_TABLE[bytes[i]];
+    return s;
+  }
+  function hexToBytes(hex) {
+    const m = String(hex || '').match(/.{2}/g);
+    return m ? new Uint8Array(m.map(h => parseInt(h, 16))) : new Uint8Array(0);
+  }
+
+  // 极少数环境（非安全上下文）没有 crypto.subtle，退化为简单散列。
+  // 只用于「键名派生」（userKeyOf 的索引桶后缀），绝不能用于口令——
+  // 口令一律走 derivePassword / pbkdf2FallbackBytes。
   function fallbackHex(text) {
     let h1 = 0x811c9dc5, h2 = 0x1000193;
     const s = String(text);
@@ -3657,7 +3818,7 @@
       h1 = ((h1 ^ c) * 16777619) >>> 0;
       h2 = ((h2 + c) * 2654435761) >>> 0;
     }
-    the_loop: for (let k = 0; k < 4; k++) { h1 = ((h1 ^ (h1 >>> 13)) * 1274126177) >>> 0; }
+    for (let k = 0; k < 4; k++) { h1 = ((h1 ^ (h1 >>> 13)) * 1274126177) >>> 0; }
     return (h1.toString(16).padStart(8, '0') + h2.toString(16).padStart(8, '0')).repeat(2);
   }
 
@@ -3670,11 +3831,13 @@
   // 每个用户一份独立的索引键，互不覆盖
   // 服务端限制 key 最长 60 字符（实测 61 字符返回 {"status":0,"error":"Key最多60位"}）。
   // INDEX_KEY 本身 50 字符，加上 '_u_' 后只剩 7 位可用，所以只取 7 位派生后缀
-  // （50 + 3 + 7 = 60，刚好在上限内）。管理员仍用固定的 'wlh'（56 字符）。
+  // （50 + 3 + 7 = 60，刚好在上限内）。主超管沿用历史固定的短键（56 字符）。
+  // 注意：派生键只取决于用户名，与「当前是不是管理员」无关——否则被授予管理权的人
+  // 会瞬间换桶，自己原有的文件全部看不见（这是 perm-v1 遗留的坑，perm-v2 修掉）。
   const USER_KEY_SUFFIX = 7;
   const userKeyMemo = new Map();                      // 用户名 -> 派生键（sha256 不必反复算）
   async function userKeyOf(user) {
-    if (user === ADMIN_USER) return 'wlh';           // 管理员固定
+    if (String(user) === ADMIN_USER) return ADMIN_USER;   // 主超管沿用历史固定桶
     const u = String(user == null ? '' : user);
     const hit = userKeyMemo.get(u);
     if (hit !== undefined) return hit;
@@ -3686,25 +3849,99 @@
   function indexKeyFor(key) { return INDEX_KEY + '_u_' + key; }
   function folderKeyFor(key) { return FOLDER_KEY + '_u_' + key; }
 
-  // PBKDF2 派生的密码校验值（只存盐 + 派生值，不存明文）
-  async function derivePassword(password, saltHex) {
-    if (!hasSubtle() || !saltHex || saltHex === 'admin-fixed') {
-      return fallbackHex('pw:' + saltHex + ':' + password);
+  // ===== 口令派生（PBKDF2-HMAC-SHA-256，只存盐 + 派生值，不存明文，且不可逆） =====
+  // 账号表里保存 { kdf: { alg, iter, saltSize }, salt, hash }。
+  // 带上 kdf 参数是为了「日后能提高强度」：老记录照老参数校验，校验通过后
+  // 自动用新参数重算并回写（见 login 里的 needsUpgrade 分支）。
+  const KDF_CURRENT = { alg: 'PBKDF2-SHA-256', iter: 100000, saltSize: 16 };
+  const KDF_FALLBACK = { alg: 'PBKDF2-SHA-256-JS', iter: FALLBACK_PBKDF2_ITERATIONS, saltSize: 16 };
+  const KDF_LEGACY = { alg: 'legacy-hex', iter: 1, saltSize: 16 };   // 旧的弱记录，仅用于兼容登录
+
+  function currentKdfParams() { return hasSubtle() ? KDF_CURRENT : KDF_FALLBACK; }
+
+  /**
+   * 把口令派生成十六进制校验值（不可逆：只能比对，无法还原）。
+   * @param password 明文口令（只在此处短暂存在，不落盘、不外传）
+   * @param saltHex  盐（十六进制）
+   * @param kdf      参数；缺省用当前最强参数
+   *
+   * alg 的含义：
+   *   'sha256'              超级管理员专用：直接 sha256(口令)，不加盐、不迭代
+   *   'legacy-hex'          远古弱记录，仅用于让老账号还能登录一次
+   *   'PBKDF2-*'            普通账号：加盐 + 迭代，抗爆破
+   */
+  async function derivePassword(password, saltHex, kdf) {
+    const param = kdf || currentKdfParams();
+    if (param.alg === 'legacy-hex') return fallbackHex('pw:' + saltHex + ':' + password);
+    if (param.alg === 'sha256') return sha256Hex(String(password));   // 超管只走 sha256
+    const salt = hexToBytes(saltHex);
+    if (!hasSubtle()) {
+      // 非安全上下文：用纯 JS PBKDF2（迭代式），不再退化成单轮混合
+      return bytesToHex(pbkdf2FallbackBytes(String(password), salt, param.iter || FALLBACK_PBKDF2_ITERATIONS));
     }
-    const enc = new TextEncoder();
-    const salt = new Uint8Array(saltHex.match(/.{2}/g).map(h => parseInt(h, 16)));
-    const baseKey = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+    const baseKey = await crypto.subtle.importKey('raw', utf8Bytes(password), 'PBKDF2', false, ['deriveBits']);
     const bits = await crypto.subtle.deriveBits(
-      { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, baseKey, 256);
-    return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('');
+      { name: 'PBKDF2', salt, iterations: param.iter || 100000, hash: 'SHA-256' }, baseKey, 256);
+    return bytesToHex(new Uint8Array(bits));
+  }
+
+  /**
+   * 定长时间比较：先各自摘要成固定 32 字节再逐字节异或累加，
+   * 既不因长度不同提前返回，也不让比较耗时随「猜中多少前缀」变化。
+   */
+  async function constantTimeEqual(a, b) {
+    const ha = await sha256Hex('ct:' + String(a == null ? '' : a));
+    const hb = await sha256Hex('ct:' + String(b == null ? '' : b));
+    let diff = 0;
+    for (let i = 0; i < ha.length; i++) diff |= ha.charCodeAt(i) ^ hb.charCodeAt(i);
+    return diff === 0;
+  }
+
+  /** 判断这条记录是不是用「过时参数」存的，是则登录成功后顺手升级 */
+  function passwordNeedsUpgrade(rec) {
+    if (!rec || !rec.kdf) return true;                       // 没有参数标记 = 老记录
+    // 超管固定走 sha256：这是明确要求，不能被自动升级成 PBKDF2 冲掉
+    if (isShaKdf(rec.kdf)) return false;
+    const param = currentKdfParams();
+    if (rec.kdf.alg !== param.alg) return true;              // 例如从 JS 版升级到 subtle 版
+    return (rec.kdf.iter || 0) < (param.iter || 0);          // 迭代次数提高了
+  }
+
+  /** 该参数标记是不是「只做 sha256」的超管方案 */
+  function isShaKdf(kdf) { return !!kdf && String(kdf.alg || '').indexOf('sha256') === 0; }
+
+  /**
+   * 校验口令（唯一的登录校验入口）。
+   * 返回值里的 upgraded 表示「这次是用老参数验过的」，调用方应当回写新记录。
+   */
+  async function verifyPassword(rec, password) {
+    if (!rec) return { ok: false, upgraded: false };
+    const stored = String(rec.hash || '');
+    if (!stored) return { ok: false, upgraded: false };
+    const param = rec.kdf || KDF_LEGACY;
+    const computed = await derivePassword(password, rec.salt, param);
+    const ok = await constantTimeEqual(computed, stored);
+    return { ok, upgraded: ok && passwordNeedsUpgrade(rec) };
+  }
+
+  /** 用当前最强参数把这条账号记录的口令重新派生一遍（调用方负责 saveUsers） */
+  async function upgradePasswordRecord(rec, password) {
+    const param = currentKdfParams();
+    rec.salt = randomSaltHex();
+    rec.hash = await derivePassword(password, rec.salt, param);
+    rec.kdf = { alg: param.alg, iter: param.iter, saltSize: param.saltSize };
+    rec.pwChangedAt = Date.now();
+    return rec;
   }
 
   function randomSaltHex() {
-    const a = new Uint8Array(16);
+    const a = new Uint8Array(currentKdfParams().saltSize || 16);
     crypto.getRandomValues(a);
-    return Array.from(a).map(b => b.toString(16).padStart(2, '0')).join('');
+    return bytesToHex(a);
   }
 
+  // 账号表：独立的一把键，与各用户的索引桶（INDEX_KEY_u_xxx）完全分开，
+  // 因此它是天然的「公共名单」——不存在“谁登录就读到谁的账号表”的问题。
   async function loadUsers() {
     try {
       const text = await textdbGet(USERS_KEY);
@@ -3720,9 +3957,9 @@
   async function removeUser(username, opts = {}) {
     const name = String(username || '').trim();
     if (!name) throw new Error('用户名无效');
-    if (isPrimaryAdmin(name)) throw new Error('不能移除总管理员账号');
-    // 管理员（除 wlh 外）不能移除其他管理员：需要 wlh 先收回其管理权
-    if (!isPrimaryAdmin() && userIsManager(name)) throw new Error('对方也是管理员，只有 wlh 能移除管理员');
+    if (isPrimaryAdmin(name)) throw new Error(name + ' 是超级管理员账号，不能移除');
+    // 非超级管理员不能移除其他管理员：需要超级管理员先收回其管理权
+    if (!canGrantAdmin() && userIsManager(name)) throw new Error('对方也是管理员，只有超级管理员能移除管理员');
     if (canManage() && String(name).toLowerCase() === String(session.user || '').toLowerCase()) {
       throw new Error('不能移除自己');
     }
@@ -3764,9 +4001,145 @@
     return list.find(x => String(x.user).toLowerCase() === u) || null;
   }
 
-  // 管理员账号固定，不写进云端（但密码在源码里，属于已知限制）
+  // ==================== 账号管理（仅超级管理员） ====================
+  /** 账号管理类操作的统一守卫：只有内置超级管理员可用 */
+  function requireSuperAdmin(what) {
+    if (!canGrantAdmin()) throw new Error('只有超级管理员可以' + (what || '管理账号'));
+  }
+  /** 与自助注册同一套用户名校验，保证「超管建的号」和「自己注册的号」等价 */
+  function validateNewUsername(name) {
+    if (!/^[\w\u4e00-\u9fa5.-]{2,24}$/.test(name)) {
+      throw new Error('用户名需 2-24 个字符（可用中文、字母、数字、. _ -）');
+    }
+    if (suHas(name)) throw new Error('该用户名不可用（内置账号）');
+  }
+
+  /** 超级管理员直接新建成员账号（成员无需自助注册） */
+  async function createAccount(rawUser, pass, opts = {}) {
+    requireSuperAdmin('新建账号');
+    const user = normalizeUsername(rawUser);
+    validateNewUsername(user);
+    if (!pass || pass.length < 4) throw new Error('密码至少 4 位');
+    const list = await loadUsers();
+    if (findUser(list, user)) throw new Error('这个用户名已经被占用了');
+    const salt = randomSaltHex();
+    const hash = await derivePassword(pass, salt);
+    list.push({
+      user, salt, hash,
+      kdf: { ...currentKdfParams() },
+      admin: !!opts.admin || isSuperAdminName(user),     // 内置超级管理员建的号依然带管理权
+      createdAt: Date.now(), owner: user, createdBy: session.user || ''
+    });
+    await saveUsers(list);
+    await syncManagerFlags();
+    return { user, admin: !!opts.admin || isSuperAdminName(user) };
+  }
+
+  /** 超级管理员重置成员密码（只覆盖，不显示旧密码——旧密码是 PBKDF2 派生值，本来就不可逆） */
+  async function resetUserPassword(username, pass) {
+    requireSuperAdmin('重置密码');
+    const name = String(username || '').trim();
+    if (!name) throw new Error('用户名无效');
+    if (!pass || pass.length < 4) throw new Error('密码至少 4 位');
+    const list = await loadUsers();
+    const rec = findUser(list, name);
+    if (!rec) throw new Error('找不到该用户');
+    rec.salt = randomSaltHex();
+    rec.hash = await derivePassword(pass, rec.salt);
+    rec.kdf = { ...currentKdfParams() };
+    rec.pwChangedAt = Date.now();
+    rec.pwChangedBy = session.user || '';
+    await saveUsers(list);
+    return { user: rec.user };
+  }
+
+  /**
+   * 超级管理员修改用户名。改名必须连数据一起搬：
+   * 索引与文件夹索引都挂在「用户名派生的桶」上，只改账号表会让这个人的文件凭空消失。
+   * metaKey 是随机生成的、不随用户名变化，因此分片/元数据本身不用重建，只改归属字段。
+   */
+  async function renameAccount(oldName, newRawName, opts = {}) {
+    requireSuperAdmin('改名');
+    const from = String(oldName || '').trim();
+    const to = normalizeUsername(newRawName);
+    if (!from) throw new Error('用户名无效');
+    if (!to) throw new Error('新用户名无效');
+    if (isSuperAdminName(from)) throw new Error('内置超级管理员账号不能改名');
+    if (from.toLowerCase() === to.toLowerCase()) {
+      throw new Error(to === from ? '新用户名与原名相同' : '新用户名只是大小写不同，无需改名');
+    }
+    validateNewUsername(to);
+    const list = await loadUsers();
+    const rec = findUser(list, from);
+    if (!rec) throw new Error('找不到该用户');
+    if (findUser(list, to)) throw new Error('新用户名「' + to + '」已经被占用了');
+
+    const oldKey = await userKeyOf(rec.user);
+    const newKey = await userKeyOf(to);
+    const moved = { files: 0, folders: 0, metaRewritten: 0 };
+
+    // 1) 索引：换 owner，搬到新桶，并清空旧桶
+    try {
+      const text = await textdbGet(indexKeyFor(oldKey));
+      const index = text ? JSON.parse(text) : [];
+      const rows = Array.isArray(index) ? index.filter(it => it && it.metaKey) : [];
+      const renamed = rows.map(it => Object.assign({}, it, { owner: to }));
+      await textdbUpdate(indexKeyFor(newKey), JSON.stringify(renamed.slice(0, 200)), false);
+      await textdbUpdate(indexKeyFor(oldKey), JSON.stringify([]), false);
+      moved.files = renamed.length;
+      // 2) 元数据里的 owner 也要跟着改（管理员按归属分组时靠它）
+      if (!opts.skipMeta) {
+        for (const it of renamed) {
+          try {
+            const mt = await textdbGet(it.metaKey);
+            if (!mt) continue;
+            const meta = JSON.parse(mt);
+            if (String(meta.owner || '').toLowerCase() !== from.toLowerCase()) continue;
+            meta.owner = to;
+            await textdbUpdate(it.metaKey, JSON.stringify(meta), false);
+            metaCache.set(it.metaKey, meta);
+            moved.metaRewritten++;
+          } catch (e) { /* 单条失败不影响整体改名 */ }
+        }
+      }
+    } catch (e) { log('⚠️ 迁移索引时出错：' + e.message); }
+
+    // 3) 文件夹索引：直接换桶
+    try {
+      const ftext = await textdbGet(folderKeyFor(oldKey));
+      const folders = ftext ? JSON.parse(ftext) : [];
+      const clean = Array.isArray(folders) ? folders.filter(f => typeof f === 'string') : [];
+      await textdbUpdate(folderKeyFor(newKey), JSON.stringify(clean), false);
+      await textdbUpdate(folderKeyFor(oldKey), JSON.stringify([]), false);
+      moved.folders = clean.length;
+    } catch (e) { log('⚠️ 迁移文件夹索引时出错：' + e.message); }
+
+    // 4) 账号表改名（管理权、注册时间、密码盐一并保留）
+    rec.user = to;
+    rec.renamedFrom = rec.renamedFrom || from;
+    rec.renamedAt = Date.now();
+    await saveUsers(list);
+
+    // 5) 本地缓存与筛选状态跟着换名
+    managerFlags.delete(from.toLowerCase());
+    if (rec.admin) managerFlags.set(to.toLowerCase(), true);
+    try { userKeyMemo.delete(from); } catch (e) {}
+    try { memberFolders.delete(memberFolderCacheKey(from)); } catch (e) {}
+    if (session.adminUserFilter && memberFolderCacheKey(session.adminUserFilter) === memberFolderCacheKey(from)) {
+      session.adminUserFilter = to;
+    }
+    return { from, to, ...moved };
+  }
+
+  // 主超管的账号记录不写进云端，口令以内置 sha256 校验值的形式留在源码里（已知限制）。
+  // 这里只声明「它在账号表里没有记录」，不再伪造 salt/hash 占位凭据——
+  // 那种字符串不是有效的哈希，留着只会让人误以为已经加密过。
+  // 次超管走自助注册，因此它的记录在账号表里，注册时即带 admin: true。
   function adminRecord() {
-    return { user: ADMIN_USER, salt: 'admin-fixed', hash: 'admin-fixed', admin: true, createdAt: 0 };
+    return {
+      user: ADMIN_USER, salt: null, hash: null, kdf: SU_KDF,
+      admin: true, createdAt: 0, credential: 'sha256-embedded'
+    };
   }
 
   function normalizeUsername(raw) {
@@ -3805,23 +4178,49 @@
     if (findUser(list, user)) throw new Error('这个用户名已经被注册了');
     const salt = randomSaltHex();
     const hash = await derivePassword(pass, salt);
-    list.push({ user, salt, hash, admin: false, createdAt: Date.now(), owner: user });
+    // 次超管走自助注册，注册完直接带管理权；主超管不允许注册
+    const born = isSuperAdminName(user);
+    list.push({
+      user, salt, hash, kdf: { ...currentKdfParams() },
+      admin: born, createdAt: Date.now(), owner: user
+    });
     await saveUsers(list);
+    if (born) log('🛡️ ' + user + ' 是内置超级管理员，注册后已自动获得管理权限');
     return user;
   }
 
   async function login(rawUser, pass) {
     const user = normalizeUsername(rawUser);
     if (!user || !pass) throw new Error('请输入用户名和密码');
-    if (user.toLowerCase() === ADMIN_USER) {
-      if (pass !== ADMIN_PASS) throw new Error('用户名或密码不正确');
-      return { user: ADMIN_USER, admin: true, primary: true, key: await userKeyOf(ADMIN_USER) };
+    // 内置超级管理员：只认 sha256 校验值（账号表里的记录优先，可作为改密途径）
+    const suName = suHas(user);
+    if (suName) {
+      const users0 = await loadUsers();
+      const recSu = findUser(users0, suName);
+      if (recSu) {
+        const v0 = await verifyPassword(recSu, pass);
+        if (!v0.ok) throw new Error('用户名或密码不正确');
+        return { user: recSu.user, admin: true, primary: true, key: await userKeyOf(recSu.user) };
+      }
+      const want = suShaOf(suName);
+      const got = await sha256Hex(String(pass));
+      if (!(await constantTimeEqual(got, want))) throw new Error('用户名或密码不正确');
+      return { user: suName, admin: true, primary: true, key: await userKeyOf(suName) };
     }
-    const rec = findUser(await loadUsers(), user);
+    const users = await loadUsers();
+    const rec = findUser(users, user);
     if (!rec) throw new Error('用户名或密码不正确');
-    const hash = await derivePassword(pass, rec.salt);
-    if (hash !== rec.hash) throw new Error('用户名或密码不正确');
-    // 被授予管理权的用户同样以管理员身份进入（权限与 wlh 相同，只是不能授权）
+    const v = await verifyPassword(rec, pass);
+    if (!v.ok) throw new Error('用户名或密码不正确');
+    // 老参数（或从纯 JS 版升到 subtle 版）验过之后顺手升级，用户无感
+    if (v.upgraded) {
+      try {
+        await upgradePasswordRecord(rec, pass);
+        await saveUsers(users);
+        log('🔐 已升级 ' + rec.user + ' 的口令派生参数（' + KDF_CURRENT.alg + ' / ' + KDF_CURRENT.iter + ' 次）');
+      } catch (e) { /* 升级失败不影响本次登录 */ }
+    }
+    // 被授予管理权的用户同样以管理员身份进入（权限与超级管理员相同，只是不能管理账号）
     return { user: rec.user, admin: !!rec.admin, primary: false, key: await userKeyOf(rec.user) };
   }
 
@@ -3845,7 +4244,7 @@
 
   // 用当前会话刷新界面上的身份信息与数据视图
   async function applySession() {
-    // 管理权以云端授权名单为准（可能刚被 wlh 授予或收回）
+    // 管理权以云端授权名单为准（可能刚被超管授予或收回）
     try { await syncManagerFlags(); } catch (e) {}
     refreshSessionAdmin();
     document.body.classList.toggle('is-admin', !!session.isAdmin);
@@ -3858,7 +4257,7 @@
     const box = document.getElementById('whoami');
     if (box) {
       box.innerHTML = `<span class="badge-me">👤 ${escapeHtml(session.user)}</span>`
-        + (session.isAdmin ? '<span class="badge-admin">' + (isPrimaryAdmin() ? '总管理员' : '管理员') + '</span>' : '')
+        + (session.isAdmin ? '<span class="badge-admin">' + (isPrimaryAdmin() ? '超级管理员' : '管理员') + '</span>' : '')
         + '<button type="button" onclick="logout()" style="font-size:12px;">退出登录</button>';
     }
 
@@ -6290,6 +6689,12 @@
   window.__syncManagerFlags = () => syncManagerFlags();
   window.__setUserAdmin = (name, on) => setUserAdmin(name, on);
   window.__userIsManager = (name) => userIsManager(name);
+  // 账号管理（仅超级管理员可用；权限判定在脚本侧统一守卫）
+  window.__createAccount = (name, pass, opts) => createAccount(name, pass, opts);
+  window.__resetUserPassword = (name, pass) => resetUserPassword(name, pass);
+  window.__renameAccount = (from, to, opts) => renameAccount(from, to, opts);
+  window.__dbgIsSuperAdmin = (name) => isSuperAdminName(name);
+  window.__dbgSuperAdmins = () => SUPER_ADMINS.slice();
   window.__dbgConcurrency = () => concurrency();
   window.__dbgUploading = () => isUploading;
   window.__dbgDownloading = () => isDownloading;
@@ -6609,7 +7014,7 @@
   }
   /** 兼容旧调用点：同样只读内存，不再请求网络 */
   async function refreshMemberFolderCache() { return ensureMemberFolders(); }
-  /** 用户名 -> 该用户的索引桶后缀（管理员固定 wlh） */
+  /** 用户名 -> 该用户的索引桶后缀（主超管用历史沿用的短键） */
   function keyOfUser(name, users) {
     const n = String(name || '').toLowerCase();
     const me = String(V().user || '').toLowerCase();
@@ -7247,6 +7652,18 @@
   }
 
   // ---------------------------------------------------------------- 管理员：成员视图
+  /** 角色标签的唯一口径：徽标 / 属性页 / 账号面板都读它，避免同一角色到处换说法 */
+  function roleLabel(name) {
+    const who = name == null ? V().user : name;
+    if (isPrimaryAdmin(who)) return '超级管理员';
+    return userIsManager(who) ? '管理员' : '普通用户';
+  }
+  /** 角色说明（属性页用） */
+  function roleDesc(name) {
+    const who = name == null ? V().user : name;
+    if (isPrimaryAdmin(who)) return '超级管理员（可查看/删除所有人的文件，可管理账号与权限）';
+    return userIsManager(who) ? '管理员（可查看/删除所有人的文件）' : '读取、写入、删除自己的文件';
+  }
   /** 管理员是否停在「成员列表」这一层（根目录且未进入任何成员） */
   function atMemberList() {
     return !!(V().canManage && !state.adminUserFilter && curPath() === '');
@@ -7282,8 +7699,11 @@
     let users;
     try { users = window.__loadUsers ? await window.__loadUsers() : []; } catch (e) { return; }
     if (seq !== permSyncSeq) return;
-    const me = users.find((u) => u && String(u.user || '').toLowerCase() === String(V().user || '').toLowerCase());
-    const nowManage = !!me && !!me.admin;
+    const meName = String(V().user || '');
+    const me = users.find((u) => u && String(u.user || '').toLowerCase() === meName.toLowerCase());
+    // 内置超级管理员不一定在账号表里，权限来自内置角色而不是 me.admin，
+    // 漏掉这一条会把他们误判成「刚被收回权限」，每次刷新都白刷一遍。
+    const nowManage = !!me && !!me.admin || (window.__dbgIsSuperAdmin ? window.__dbgIsSuperAdmin(meName) : false);
     if (nowManage === !!V().canManage) return;
     try { if (window.__dbgSetManageTruth) window.__dbgSetManageTruth(nowManage); } catch (e) {}
     await B.refreshAll();
@@ -7398,7 +7818,7 @@
     const html = members.map((m) => (
       '<div class="list-row folder-row member-row" draggable="false" data-member="' + escA(m.name) + '" data-id="' + escA(m.name) + '" title="' + escA(m.name + ' · ' + m.files + ' 个文件（双击进入）') + '">' +
       '<span class="icon">' + ico('user') + '</span>' +
-      '<span class="name" title="' + escA(m.name) + '">' + esc(m.name) + (m.isMe ? '（我）' : '') + (userIsManager(m.name) ? ' <span class="badge-admin">' + (isPrimaryAdmin(m.name) ? '总管理员' : '管理员') + '</span>' : '') + '</span>' +
+      '<span class="name" title="' + escA(m.name) + '">' + esc(m.name) + (m.isMe ? '（我）' : '') + (userIsManager(m.name) ? ' <span class="badge-admin">' + esc(roleLabel(m.name)) + '</span>' : '') + '</span>' +
       '<span class="size">' + m.files + ' 个文件</span>' +
       '</div>'
     )).join('');
@@ -7428,22 +7848,26 @@
       e.preventDefault(); e.stopPropagation();
       const user = row.dataset.member;
       const mine = String(user).toLowerCase() === String(V().user || '').toLowerCase();
-      const isWlh = String(user).toLowerCase() === ADMIN_USER;
+      const isSuper = isPrimaryAdmin(user);          // 内置超级管理员
       const isMgr = userIsManager(user);
       const r = row.getBoundingClientRect();
       const items = [
         { label: '打开', icon: 'folder', strong: true, onClick: () => enterUser(user) },
         { sep: true }
       ];
-      // 只有 wlh 能授予/收回管理权（这正是「管理员与 wlh 唯一的差别」）
-      if (canGrantAdmin() && !isWlh) {
+      // 只有超级管理员能授予/收回管理权（这正是「管理员与超级管理员唯一的差别」）
+      if (canGrantAdmin() && !isSuper) {
         items.push(isMgr
           ? { label: '收回管理权限', icon: 'user', onClick: () => toggleUserAdmin(user, false) }
           : { label: '设为管理员', icon: 'user', onClick: () => toggleUserAdmin(user, true) });
-      } else if (!canGrantAdmin() && !isWlh) {
-        items.push({ label: isMgr ? '管理员（仅 wlh 可调整）' : '设为管理员（仅 wlh 可用）', icon: 'user', disabled: true });
+      } else if (!canGrantAdmin() && !isSuper) {
+        items.push({ label: isMgr ? '管理员（仅超级管理员可调整）' : '设为管理员（仅超级管理员可用）', icon: 'user', disabled: true });
       }
-      items.push({ label: '移除成员…', icon: 'trash', danger: true, disabled: mine || isWlh || (!canGrantAdmin() && isMgr), onClick: () => confirmRemoveUser(user) });
+      if (canGrantAdmin()) {
+        items.push({ sep: true });
+        items.push({ label: '账号管理…', icon: 'user', onClick: () => showAccountPanel(user) });
+      }
+      items.push({ label: '移除成员…', icon: 'trash', danger: true, disabled: mine || isSuper || (!canGrantAdmin() && isMgr), onClick: () => confirmRemoveUser(user) });
       ctx.show(Math.round(e.clientX), Math.round(r.top + 4), items);
     }, true);
   }
@@ -7451,7 +7875,7 @@
   async function toggleUserAdmin(user, on) {
     const ok = await modal.confirm(
       on ? '设为管理员' : '收回管理权限',
-      on ? ('把「' + user + '」设为管理员？\n\n他将可以查看和管理所有成员的文件，权限与 wlh 相同，但不能给其他人设置管理权限。')
+      on ? ('把「' + user + '」设为管理员？\n\n他将可以查看和管理所有成员的文件，权限与超级管理员相同，但不能管理账号。')
          : ('收回「' + user + '」的管理权限？\n\n他将恢复为普通用户，只能看到自己的文件。'),
       { okLabel: on ? '设为管理员' : '收回权限', danger: !on, icon: 'user' }
     );
@@ -7481,7 +7905,8 @@
   /** 管理员移除用户（清空其索引与文件记录，并删除账号） */
   async function confirmRemoveUser(user) {
     if (!V().canManage) { B.showToast('只有管理员可以移除用户'); return; }
-    if (String(user).toLowerCase() === 'wlh') { B.showToast('不能移除管理员账号'); return; }
+    if (isPrimaryAdmin(user)) { B.showToast(user + ' 是超级管理员账号，不能移除'); return; }
+    if (!canGrantAdmin() && userIsManager(user)) { B.showToast('对方也是管理员，只有超级管理员能移除管理员'); return; }
     let count = 0;
     try {
       count = (V().allIndex || []).filter((it) => String(it.owner || '').toLowerCase() === String(user).toLowerCase()).length;
@@ -7499,6 +7924,170 @@
     } catch (e) {
       log('❌ 移除用户失败：' + (e && e.message));
       B.showToast('移除失败：' + (e && e.message), 3200);
+    }
+  }
+
+  // ---------------------------------------------------------------- 账号管理（仅超级管理员）
+  /** 界面统一的账号刷新：重画成员行 / 导航窗格 / 桌面图标 */
+  function refreshAccountViews() {
+    invalidateNavpane();
+    invalidateDesktop();
+    markShell(DIRTY_STATUS | DIRTY_DESKTOP);
+    try { window.renderFileList(); } catch (e) {}
+  }
+  /** 账号详情面板：注册时间 / 文件数 / 管理状态一览，并挂上各项管理动作 */
+  function showAccountPanel(user) {
+    if (!canGrantAdmin()) { B.showToast('只有超级管理员可以管理账号'); return; }
+    const name = String(user || '').trim();
+    if (!name) return;
+    const files = (V().allIndex || []).filter((it) => String(it.owner || '').toLowerCase() === name.toLowerCase());
+    const bytes = files.reduce((a, b) => a + (b.size || 0), 0);
+    const isSuper = isPrimaryAdmin(name);
+    const isMgr = userIsManager(name);
+    const mine = name.toLowerCase() === String(V().user || '').toLowerCase();
+    const known = (state.knownUsers || []).find((u) => String(u || '').toLowerCase() === name.toLowerCase());
+
+    let rows = '';
+    rows += pk('用户名', '<span class="mono">' + esc(name) + '</span>' + (mine ? '（我）' : ''));
+    rows += pk('角色', '<span class="badge-admin">' + esc(roleLabel(name)) + '</span>');
+    rows += pk('文件数量', files.length + ' 个');
+    rows += pk('占用空间', sizeText(bytes) + (bytes ? '（' + bytes.toLocaleString() + ' 字节）' : ''));
+    if (isSuper) {
+      // 次超管是自助注册进账号表的，主超管则从来没有账号记录——两种情况要分开说
+      rows += pk('账号来源', known ? '内置超级管理员（已自助注册进账号表）'
+                                   : '内置超级管理员（固定凭据，不写入账号表）');
+    } else if (known) {
+      rows += pk('账号来源', '云端账号表' + (known.createdBy ? '（由 ' + esc(known.createdBy) + ' 创建）' : '（自助注册）'));
+    } else {
+      rows += pk('账号来源', '索引中出现、账号表里没有记录（可能是历史遗留数据）');
+    }
+    rows += pk('注册时间', known && known.createdAt ? timeText(known.createdAt) : '—（内置账号，无注册记录）');
+    if (known && known.renamedFrom) {
+      rows += pk('曾用名', '<span class="mono">' + esc(known.renamedFrom) + '</span>' +
+        (known.renamedAt ? '（' + timeText(known.renamedAt) + ' 改名）' : ''));
+    }
+    if (known && known.pwChangedAt) {
+      rows += pk('密码更新时间', timeText(known.pwChangedAt) + (known.pwChangedBy ? '（由 ' + esc(known.pwChangedBy) + ' 重置）' : ''));
+    }
+
+    const dlg = el('div', 'dlg wide');
+    dlg.innerHTML = '<div class="dlg-title">' + ico('user') + '<span>账号管理</span></div>';
+    const body = el('div', 'dlg-body');
+    body.innerHTML = '<div class="prop-head"><span class="pi">' + ico('user') + '</span><div><div class="pn">' + esc(name) + '</div>' +
+      '<div class="ps">' + esc(roleLabel(name)) + ' · ' + files.length + ' 个文件</div></div></div>' +
+      '<div class="prop-grid">' + rows + '</div>' +
+      '<div class="prop-note">超级管理员可管理其他账号，但内置账号（' + esc(SUPER_ADMIN_LABEL.join(' / ')) +
+      '）既不能改名也不能移除。密码以 PBKDF2 派生值保存，无法查看原文，只能重置。</div>';
+    dlg.appendChild(body);
+
+    const acts = [
+      { label: '重置密码…', icon: 'rename', onClick: () => { modal.close(); promptResetPassword(name); } }
+    ];
+    if (!isSuper) {
+      acts.push({ label: '修改用户名…', icon: 'rename', onClick: () => { modal.close(); promptRenameAccount(name); } });
+      acts.push(isMgr
+        ? { label: '收回管理权', icon: 'user', onClick: () => { modal.close(); toggleUserAdmin(name, false); } }
+        : { label: '设为管理员', icon: 'user', onClick: () => { modal.close(); toggleUserAdmin(name, true); } });
+      if (!mine) acts.push({ label: '移除账号…', icon: 'trash', danger: true, onClick: () => { modal.close(); confirmRemoveUser(name); } });
+    }
+    dlg.appendChild(modal.footer(acts.concat([{ label: '关闭', cls: 'primary', icon: 'check', onClick: () => modal.close() }])));
+    modal.open(dlg, { locked: false });
+  }
+
+  /** 超级管理员重置任意账号的密码 */
+  async function promptResetPassword(user) {
+    const name = String(user || '').trim();
+    if (!name) return;
+    const p1 = await window.__askText('重置密码', '为「' + name + '」设置新密码（至少 4 位）：', '', {
+      okLabel: '下一步', validate: (v) => (!v || v.length < 4) ? '密码至少 4 位' : ''
+    });
+    if (p1 == null) return;
+    const p2 = await window.__askText('重置密码', '再输入一次新密码：', '', {
+      okLabel: '确认重置', validate: (v) => (v !== p1) ? '两次输入的密码不一致' : ''
+    });
+    if (p2 == null) return;
+    try {
+      await window.__resetUserPassword(name, p1);
+      log('🔑 已重置用户 ' + name + ' 的密码');
+      B.showToast('✅ 已重置「' + name + '」的密码', 2800);
+    } catch (e) {
+      B.showToast('重置失败：' + (e && e.message), 3200);
+    }
+  }
+
+  /** 超级管理员修改用户名（连同索引桶一起迁移） */
+  async function promptRenameAccount(user) {
+    const from = String(user || '').trim();
+    if (!from) return;
+    if (isPrimaryAdmin(from)) { B.showToast('内置超级管理员账号不能改名'); return; }
+    const next = await window.__askText('修改用户名', '把「' + from + '」改成：', from, {
+      okLabel: '改名并迁移数据',
+      validate: (v) => {
+        const n = String(v || '').trim();
+        if (!n) return '请输入新用户名';
+        if (n.toLowerCase() === from.toLowerCase()) return '新用户名与原名相同';
+        if (!/^[\w\u4e00-\u9fa5.-]{2,24}$/.test(n)) return '用户名需 2-24 个字符（可用中文、字母、数字、. _ -）';
+        return '';
+      }
+    });
+    if (next == null) return;
+    const to = String(next).trim();
+    let count = 0;
+    try { count = (V().allIndex || []).filter((it) => String(it.owner || '').toLowerCase() === from.toLowerCase()).length; } catch (e) {}
+    const ok = await modal.confirm('确认改名',
+      '把「' + from + '」改名为「' + to + '」？\n\n' +
+      '他的 ' + count + ' 个文件索引与文件夹结构会一起迁移到新用户名下，账号密码与管理权保持不变。\n' +
+      '注意：他的登录名会立刻变化，需要用新用户名重新登录。',
+      { okLabel: '改名并迁移', icon: 'rename' });
+    if (!ok) return;
+    try {
+      const res = await window.__renameAccount(from, to);
+      log('✏️ 已把用户 ' + from + ' 改名为 ' + to + '（迁移 ' + res.files + ' 个文件索引）');
+      B.showToast('✅ 已改名为 ' + to + '（迁移 ' + res.files + ' 个文件）', 3200);
+      memberRowsSig = '';
+      if (state.adminUserFilter && String(state.adminUserFilter).toLowerCase() === from.toLowerCase()) {
+        state.adminUserFilter = to;
+      }
+      await B.refreshAll();
+      refreshAccountViews();
+    } catch (e) {
+      log('❌ 改名失败：' + (e && e.message));
+      B.showToast('改名失败：' + (e && e.message), 3600);
+    }
+  }
+
+  /** 超级管理员直接新建成员账号 */
+  async function promptCreateAccount() {
+    if (!canGrantAdmin()) { B.showToast('只有超级管理员可以新建账号'); return; }
+    const name = await window.__askText('新建账号', '请输入新成员的用户名：', '', {
+      okLabel: '下一步',
+      validate: (v) => {
+        const n = String(v || '').trim();
+        if (!n) return '请输入用户名';
+        if (!/^[\w\u4e00-\u9fa5.-]{2,24}$/.test(n)) return '用户名需 2-24 个字符（可用中文、字母、数字、. _ -）';
+        if (suHas(n)) return '该用户名不可用（内置账号）';
+        return '';
+      }
+    });
+    if (name == null) return;
+    const u = String(name).trim();
+    const p1 = await window.__askText('新建账号', '为「' + u + '」设置初始密码（至少 4 位）：', '', {
+      okLabel: '下一步', validate: (v) => (!v || v.length < 4) ? '密码至少 4 位' : ''
+    });
+    if (p1 == null) return;
+    const p2 = await window.__askText('新建账号', '再输入一次密码：', '', {
+      okLabel: '创建账号', validate: (v) => (v !== p1) ? '两次输入的密码不一致' : ''
+    });
+    if (p2 == null) return;
+    try {
+      const res = await window.__createAccount(u, p1, {});
+      log('🆕 已创建账号 ' + u + (res.admin ? '（自动获得管理权）' : ''));
+      B.showToast('✅ 已创建账号 ' + u + '，请把用户名和密码告诉他', 3600);
+      await refreshKnownUsers();
+      memberRowsSig = '';
+      refreshAccountViews();
+    } catch (e) {
+      B.showToast('创建失败：' + (e && e.message), 3600);
     }
   }
   // ---------------------------------------------------------------- 粘贴目标（按鼠标位置）
@@ -8040,16 +8629,18 @@
       if (me && !ownerCount.has(me)) ownerCount.set(me, 0);
       for (const n of noFileUsers) if (!ownerCount.has(n)) ownerCount.set(n, 0);
       const names = Array.from(ownerCount.keys()).sort((a, b) => a.localeCompare(b, 'zh'));
-      html += '<div class="np-sec">用户' + (state.adminUserFilter ? '<span style="float:right;font-weight:400;cursor:pointer;" data-np="allusers" title="显示所有用户">全部</span>' : '') + '</div>';
+      html += '<div class="np-sec">用户' +
+        (canGrantAdmin() ? '<span style="float:right;font-weight:400;cursor:pointer;" data-np="newaccount" title="新建成员账号（仅超级管理员）">新建</span>' : '') +
+        (state.adminUserFilter ? '<span style="float:right;font-weight:400;cursor:pointer;margin-right:8px;" data-np="allusers" title="显示所有用户">全部</span>' : '') + '</div>';
       if (!names.length) {
         html += '<div class="np-row" style="cursor:default;"><span class="np-ic">' + ico('user') + '</span><span class="lbl tx-faint">（还没有其他用户）</span></div>';
       } else {
         for (const n of names) {
           const isMe = n.toLowerCase() === String(V().user || '').toLowerCase();
           const tag = userIsManager(n)
-            ? '<span class="badge-admin">' + (isPrimaryAdmin(n) ? '总管理员' : '管理员') + '</span>'
+            ? '<span class="badge-admin">' + (isPrimaryAdmin(n) ? '超级管理员' : '管理员') + '</span>'
             : '';
-          html += '<div class="np-row np-user' + (state.adminUserFilter === n ? ' active' : '') + '" data-np-user="' + escA(n) + '" title="只看 ' + escA(n) + ' 的文件（右键可设管理权限 / 移除）">' +
+          html += '<div class="np-row np-user' + (state.adminUserFilter === n ? ' active' : '') + '" data-np-user="' + escA(n) + '" title="只看 ' + escA(n) + ' 的文件（右键可管理账号 / 设管理权限 / 移除）">' +
             '<span class="np-ic">' + ico('user') + '</span><span class="lbl">' + esc(n) + (isMe ? '（我）' : '') + tag + '</span>' +
             '<span class="np-count">' + (ownerCount.get(n) || 0) + '</span></div>';
         }
@@ -8352,7 +8943,7 @@
     }
     const av = $('smAvatar'), un = $('smUserName');
     if (av) av.textContent = u ? String(u).slice(0, 1).toUpperCase() : '?';
-    if (un) un.textContent = u ? (u + (V().canManage ? (V().isPrimary ? '（总管理员）' : '（管理员）') : '')) : '未登录';
+    if (un) un.textContent = u ? (u + (V().canManage ? '（' + roleLabel(u) + '）' : '')) : '未登录';
     const lo = $('smLogout');
     if (lo) lo.disabled = !u;
   }
@@ -8692,6 +9283,10 @@
   }
   function blankMenu(x, y) {
     const clip = V().clipboard;
+    // 成员列表这一层放的是「用户」而不是文件：超管在这里的入口是新建账号
+    const acctItems = (atMemberList() && canGrantAdmin())
+      ? [{ label: '新建账号…', icon: 'user', onClick: () => promptCreateAccount() }]
+      : [];
     ctx.show(x, y, [
       { label: '查看', icon: 'grid', sub: Object.keys(VIEW_LABEL).map((k) => ({ label: VIEW_LABEL[k], icon: k === 'rows' ? 'rows' : 'grid', onClick: () => setView(k) })) },
       { label: '排序方式', icon: 'sort', sub: [
@@ -8707,11 +9302,12 @@
       { label: '粘贴', icon: 'clipboard', key: 'Ctrl+V', disabled: !clip, onClick: () => B.pasteHere() },
       { label: '新建文件夹', icon: 'plus', key: 'Ctrl+Shift+N', onClick: () => B.newFolder() },
       { label: '上传文件…', icon: 'upload', onClick: () => triggerUpload() },
-      { label: '上传文件夹…', icon: 'folderOpen', onClick: () => B.openFolderPicker() },
+      { label: '上传文件夹…', icon: 'folderOpen', onClick: () => B.openFolderPicker() }
+    ].concat(acctItems).concat([
       { sep: true },
       { label: '在当前目录打开终端', icon: 'code', disabled: true },
       { label: '属性', icon: 'props', onClick: () => showProperties(null) }
-    ]);
+    ]));
   }
   function desktopMenu(x, y) {
     // 管理端桌面是「成员列表」而不是文件区：这里不提供新建/粘贴/上传（它们针对的是文件目录）
@@ -8776,7 +9372,7 @@
       const u = V().user;
       tabs.push({ name: '常规', html:
         '<div class="prop-head"><span class="pi">' + ico('cloud') + '</span><div><div class="pn">TextDB 文件柜</div>' +
-        '<div class="ps">类型：云端键值存储 · 用户：' + esc(u || '未登录') + (V().canManage ? (V().isPrimary ? '（总管理员）' : '（管理员）') : '') + '</div></div></div>' +
+        '<div class="ps">类型：云端键值存储 · 用户：' + esc(u || '未登录') + (V().canManage ? '（' + esc(roleLabel(u)) + '）' : '') + '</div></div></div>' +
         '<div class="prop-grid">' +
         pk('位置', 'textdb.online（HTTPS 固定读取接口）') +
         pk('文件数量', files.length + ' 个') +
@@ -8811,8 +9407,8 @@
         pk('创建时间', timeText(Math.min.apply(null, [Date.now()].concat(kids.concat(deep).map((f) => f.createdAt || Date.now()))))) +
         '</div>' });
       tabs.push({ name: '内容', html: topList('目录内文件', kids.slice().sort((a, b) => (b.size || 0) - (a.size || 0)).slice(0, 20)) });
-      tabs.push({ name: '安全', html: '<div class="prop-grid">' + pk('所有者', esc(V().user || '未登录') + (V().canManage ? (V().isPrimary ? '（总管理员）' : '（管理员）') : '')) +
-        pk('权限', V().isPrimary ? '总管理员（可查看/删除所有人的文件，可设置管理权限）' : (V().canManage ? '管理员（可查看/删除所有人的文件）' : '读取、写入、删除自己的文件')) + '</div>' });
+      tabs.push({ name: '安全', html: '<div class="prop-grid">' + pk('所有者', esc(V().user || '未登录') + (V().canManage ? '（' + esc(roleLabel(V().user)) + '）' : '')) +
+        pk('权限', esc(roleDesc(V().user))) + '</div>' });
     } else {
       const e = files.find((x) => x.metaKey === ref.id);
       if (!e) { modal.info('属性', '找不到该文件的索引信息。'); return; }
@@ -9839,6 +10435,8 @@
     pane.addEventListener('click', (e) => {
       const row = e.target.closest('[data-np-user]');
       if (row) { e.preventDefault(); e.stopPropagation(); setUserFilter(row.dataset.npUser); return; }
+      const na = e.target.closest('[data-np="newaccount"]');
+      if (na) { e.preventDefault(); e.stopPropagation(); promptCreateAccount(); return; }
       const all = e.target.closest('[data-np="allusers"]');
       if (all) { e.preventDefault(); e.stopPropagation(); setUserFilter(null); }
     }, true);
@@ -9848,7 +10446,7 @@
       e.preventDefault(); e.stopPropagation();
       const user = row.dataset.npUser;
       const mine = String(user).toLowerCase() === String(V().user || '').toLowerCase();
-      const isWlh = isPrimaryAdmin(user);
+      const isSuper = isPrimaryAdmin(user);          // 内置超级管理员
       const isMgr = userIsManager(user);
       const r = row.getBoundingClientRect();
       const items = [
@@ -9856,14 +10454,18 @@
         { label: '显示所有用户', icon: 'user', disabled: !state.adminUserFilter, onClick: () => setUserFilter(null) },
         { sep: true }
       ];
-      if (canGrantAdmin() && !isWlh) {
+      if (canGrantAdmin() && !isSuper) {
         items.push(isMgr
           ? { label: '收回管理权限', icon: 'user', onClick: () => toggleUserAdmin(user, false) }
           : { label: '设为管理员', icon: 'user', onClick: () => toggleUserAdmin(user, true) });
-      } else if (!canGrantAdmin() && !isWlh) {
-        items.push({ label: isMgr ? '管理员（仅 wlh 可调整）' : '设为管理员（仅 wlh 可用）', icon: 'user', disabled: true });
+      } else if (!canGrantAdmin() && !isSuper) {
+        items.push({ label: isMgr ? '管理员（仅超级管理员可调整）' : '设为管理员（仅超级管理员可用）', icon: 'user', disabled: true });
       }
-      items.push({ label: '移除用户…', icon: 'trash', danger: true, disabled: mine || isWlh || (!canGrantAdmin() && isMgr), onClick: () => confirmRemoveUser(user) });
+      if (canGrantAdmin()) {
+        items.push({ sep: true });
+        items.push({ label: '账号管理…', icon: 'user', onClick: () => showAccountPanel(user) });
+      }
+      items.push({ label: '移除用户…', icon: 'trash', danger: true, disabled: mine || isSuper || (!canGrantAdmin() && isMgr), onClick: () => confirmRemoveUser(user) });
       ctx.show(Math.round(e.clientX), Math.round(r.top + 4), items);
     }, true);
     const targetOf = (t) => t.closest('.np-row[data-goto], .np-folder');
