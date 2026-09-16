@@ -15,6 +15,7 @@
                          无 crypto.subtle 时走纯 JS 的 PBKDF2（不再退化为单轮散列）；口令比对定长时间）
             + su-v1（超管账号名以十六进制常量存放、运行时解码，源码中不出现账号名；
                      超管口令只存 sha256 校验值，不可逆；普通账号仍用加盐 PBKDF2）
+            + su-v2（第 2 个超管名拼写修正；旧拼写的账号与数据桶一次性自动迁移）
   如果页面行为像旧版本，请强制刷新：Ctrl+F5（或 Ctrl+Shift+R）清掉浏览器缓存。
 -->
 <html lang="zh-CN">
@@ -3607,7 +3608,18 @@
    * 本文件（前端源码，任何人可见）里既没有账号名，也没有任何口令明文；
    * 校验是不可逆的——只能拿 sha256(输入) 与下面的校验值比对，无法反推出原口令。
    */
-  const SU_HEX = ['776c68', '53757669766f72'];
+  const SU_HEX = ['776c68', '5375727669766f72'];
+
+  /*
+   * 历史遗留：曾发布过的错误拼写（同样是十六进制，源码里不出现账号名）。
+   * 每一项按**下标**对应 SU_HEX 里同一位置的正确名字，用 [历史拼写, 规范拼写] 成对给出：
+   * 修正拼写后，光看运行时名单已经无法推断谁该迁给谁（历史名不在名单里了），
+   * 早期版本按「取另一个超管名」去猜，结果会把次超管的账号迁到主超管名下 —— 必须显式成对。
+   * 老账号一次性迁完后，这个数组可以整个删掉。
+   */
+  const SU_LEGACY_HEX = [
+    ['53757669766f72', '5375727669766f72']
+  ];
   const SU_SHA = [
     '52cecfcf3e71ae33fb59e52594f27e8061d2816156e5cbf34d6b2de9c9512a5d',
     '6a973325e810378699e7878c216d363e3abe868a9a49af92cb74140c976a5aef'
@@ -3626,6 +3638,21 @@
   function suHas(name) {
     const n = String(name == null ? '' : name).toLowerCase();
     for (const a of SUPER_ADMINS) if (a.toLowerCase() === n) return a;
+    return null;
+  }
+  /**
+   * 登录用：把输入的名字解析成「规范超管名」。
+   * 除了认当前的两个名字，还额外接受历史拼错的那一个——否则那个账号
+   * 永远登不进来，也就永远触发不了一次性迁移。返回值第二个元素标记
+   * 「这次是按拼错的名字进来的」，登录成功后据此顺带把账号迁到正确拼写下。
+   */
+  function suResolve(name) {
+    const hit = suHas(name);
+    if (hit) return { name: hit, legacy: false };
+    const want = String(name == null ? '' : name).toLowerCase();
+    for (const old of suLegacyNames()) {
+      if (old.toLowerCase() === want) return { name: old, legacy: true };
+    }
     return null;
   }
   /** 该超级管理员的内置 sha256 校验值 */
@@ -3650,6 +3677,23 @@
   }
   /** isPrimaryAdmin 保留旧名：现在指「内置超级管理员」，两个超管彼此等价 */
   function isPrimaryAdmin(who) { return isSuperAdminName(who); }
+  /**
+   * 拼错名字对应的「现在该叫什么」。
+   * 查的是 SU_LEGACY_HEX 里成对给出的映射，不靠运行时名单去猜：
+   * 修正拼写后历史名已经不在 SUPER_ADMINS 里，任何「取另一个超管」的推断都会指错人。
+   */
+  function suFixedNameOfLegacy(legacyName) {
+    const want = String(legacyName == null ? '' : legacyName).toLowerCase();
+    for (const pair of (Array.isArray(SU_LEGACY_HEX) && Array.isArray(SU_LEGACY_HEX[0]) ? SU_LEGACY_HEX : [])) {
+      if (hexUtf8(pair[0]).toLowerCase() === want) return hexUtf8(pair[1]);
+    }
+    return null;
+  }
+  /** 所有历史拼写（登录时接受它们，登入后顺带迁移） */
+  function suLegacyNames() {
+    if (!Array.isArray(SU_LEGACY_HEX) || !Array.isArray(SU_LEGACY_HEX[0])) return [];
+    return SU_LEGACY_HEX.map((p) => hexUtf8(p[0]));
+  }
   /** 当前登录者是否拥有管理端功能（超级管理员或已被授权的管理员） */
   function canManage() {
     if (!session.user) return false;
@@ -4131,6 +4175,73 @@
     return { from, to, ...moved };
   }
 
+  /**
+   * 一次性迁移：把「拼错名字」的超管账号搬到正确拼写之下。
+   * 为什么必须迁移而不是只改常量：索引与文件夹索引都挂在「用户名派生的桶」上，
+   * 只换名字会让这个人的文件全部变成孤儿（账号还在、文件全看不见）。
+   * 没有老记录、或目标名已被占用时直接跳过，不做任何读写。
+   */
+  let suTypoMigrating = false;
+  async function migrateLegacySuperAdmin() {
+    if (suTypoMigrating) return null;
+    suTypoMigrating = true;
+    try {
+      let users;
+      try { users = await loadUsers(); } catch (e) { return null; }
+      let done = null;
+      for (const legacy of suLegacyNames()) {
+        const target = suFixedNameOfLegacy(legacy);
+        if (!target || target.toLowerCase() === legacy.toLowerCase()) continue;
+        const rec = findUser(users, legacy);
+        if (!rec) continue;                          // 从没注册过：没有数据要搬
+        if (findUser(users, target)) continue;       // 目标名已被占用：不动，避免覆盖别人
+
+        const oldKey = await userKeyOf(rec.user);
+        const newKey = await userKeyOf(target);
+        let files = 0;
+        try {
+          const text = await textdbGet(indexKeyFor(oldKey));
+          const rows = (text ? JSON.parse(text) : []);
+          const moved = (Array.isArray(rows) ? rows : [])
+            .filter((it) => it && it.metaKey)
+            .map((it) => Object.assign({}, it, { owner: target }));
+          if (moved.length) {
+            await textdbUpdate(indexKeyFor(newKey), JSON.stringify(moved.slice(0, 200)), false);
+            await textdbUpdate(indexKeyFor(oldKey), JSON.stringify([]), false);
+            files = moved.length;
+          }
+        } catch (e) { log('⚠️ 迁移超管索引时出错：' + e.message); }
+        try {
+          const ftext = await textdbGet(folderKeyFor(oldKey));
+          const folders = (ftext ? JSON.parse(ftext) : []);
+          const clean = (Array.isArray(folders) ? folders : []).filter((f) => typeof f === 'string');
+          if (clean.length) {
+            await textdbUpdate(folderKeyFor(newKey), JSON.stringify(clean), false);
+            await textdbUpdate(folderKeyFor(oldKey), JSON.stringify([]), false);
+          }
+        } catch (e) { log('⚠️ 迁移超管目录时出错：' + e.message); }
+
+        rec.user = target;
+        rec.admin = true;                            // 内置超管始终带管理权
+        rec.renamedFrom = rec.renamedFrom || legacy;
+        rec.renamedAt = Date.now();
+        if (session.user && String(session.user).toLowerCase() === legacy.toLowerCase()) session.user = target;
+        try { userKeyMemo.delete(legacy); } catch (e) {}
+        try { memberFolders.delete(memberFolderCacheKey(legacy)); } catch (e) {}
+        done = { from: legacy, to: target, files };
+      }
+      if (!done) return null;
+      await saveUsers(users);
+      log('✏️ 已把拼错的超管账号迁移为正确拼写（迁移 ' + done.files + ' 个文件索引）');
+      return done;
+    } catch (e) {
+      log('⚠️ 超管账号迁移失败（不影响登录）：' + e.message);
+      return null;
+    } finally {
+      suTypoMigrating = false;
+    }
+  }
+
   // 主超管的账号记录不写进云端，口令以内置 sha256 校验值的形式留在源码里（已知限制）。
   // 这里只声明「它在账号表里没有记录」，不再伪造 salt/hash 占位凭据——
   // 那种字符串不是有效的哈希，留着只会让人误以为已经加密过。
@@ -4193,14 +4304,18 @@
     const user = normalizeUsername(rawUser);
     if (!user || !pass) throw new Error('请输入用户名和密码');
     // 内置超级管理员：只认 sha256 校验值（账号表里的记录优先，可作为改密途径）
-    const suName = suHas(user);
-    if (suName) {
+    const suTarget = suResolve(user);
+    if (suTarget) {
+      const suName = suTarget.name;
       const users0 = await loadUsers();
       const recSu = findUser(users0, suName);
       if (recSu) {
         const v0 = await verifyPassword(recSu, pass);
         if (!v0.ok) throw new Error('用户名或密码不正确');
-        return { user: recSu.user, admin: true, primary: true, key: await userKeyOf(recSu.user) };
+        const who = recSu.user;
+        // 按拼错的名字登进来时，顺带把账号与数据搬到正确拼写下
+        if (suTarget.legacy) { try { await migrateLegacySuperAdmin(); } catch (e) {} }
+        return { user: who, admin: true, primary: true, key: await userKeyOf(who) };
       }
       const want = suShaOf(suName);
       const got = await sha256Hex(String(pass));
