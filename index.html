@@ -16,6 +16,10 @@
             + su-v1（超管账号名以十六进制常量存放、运行时解码，源码中不出现账号名；
                      超管口令只存 sha256 校验值，不可逆；普通账号仍用加盐 PBKDF2）
             + su-v2（第 2 个超管名拼写修正；旧拼写的账号与数据桶一次性自动迁移）
+            + del-v1（删除用户真正删干净：账号/索引桶/文件夹桶/元数据/分片全清 + 桶登记表回收历史残留桶）
+            + del-v2（删人后目录缓存与派生目录一起重算：界面/导航窗格不再留着已删用户的文件夹）
+            + del-v3（移除用户改为「按 owner 扫全部候选桶 + 分片全局并发删除 + 先删分片再删元数据最后写回索引」，并补回合并时漏掉的 sweepOrphanBuckets；删除过程有可取消的进度条）
+  合并说明：本文件 = 部署版（shell-v7 … su-v2）+ 本地版删除用户修复（del-v1 / del-v2 / del-v3）。
   如果页面行为像旧版本，请强制刷新：Ctrl+F5（或 Ctrl+Shift+R）清掉浏览器缓存。
 -->
 <html lang="zh-CN">
@@ -1740,6 +1744,7 @@
   let isUploading = false;
   let isDownloading = false;
   let busyAbort = null;                        // 当前任务的取消句柄
+  let isPurging = false;                       // 正在移除用户（删除任务）
   let runningPool = null;                      // 正在跑的任务池（取消时一并中断）
   let downloadSeq = 0;                         // 下载任务编号（防止旧任务覆盖新任务的进度显示）
   const metaCache = new Map();                 // metaKey -> meta
@@ -2310,6 +2315,7 @@
   async function saveIndexForBucket(bucketKey, list) {
     let l = Array.isArray(list) ? list.slice() : [];
     if (l.length > 200) l = l.slice(0, 200);
+    rememberBucket(indexKeyFor(bucketKey), '');
     await textdbUpdate(indexKeyFor(bucketKey), JSON.stringify(l), false);
     return l;
   }
@@ -3878,7 +3884,12 @@
   // （50 + 3 + 7 = 60，刚好在上限内）。主超管沿用历史固定的短键（56 字符）。
   // 注意：派生键只取决于用户名，与「当前是不是管理员」无关——否则被授予管理权的人
   // 会瞬间换桶，自己原有的文件全部看不见（这是 perm-v1 遗留的坑，perm-v2 修掉）。
-  const USER_KEY_SUFFIX = 7;
+  // 服务端键长硬上限 60。注意 INDEX_KEY 是两个下标键共用的前缀，比单桶最终键还长，
+  // 所以后缀长度要按「INDEX_KEY 的长度」反推并留足余量：固定长度在长前缀下会超限。
+  const USER_KEY_SUFFIX = (function () {
+    var pre = (typeof INDEX_KEY === 'string' && INDEX_KEY) ? INDEX_KEY.length : 52;
+    return Math.max(5, Math.min(7, 60 - pre - 3));
+  })();
   const userKeyMemo = new Map();                      // 用户名 -> 派生键（sha256 不必反复算）
   async function userKeyOf(user) {
     if (String(user) === ADMIN_USER) return ADMIN_USER;   // 主超管沿用历史固定桶
@@ -3994,47 +4005,509 @@
     } catch (e) { return []; }
   }
 
+  // ===== 用户数据桶登记表 =====
+  // 云端是扁平 KV、没有列举接口，而「文件到底存在哪个桶」取决于用户名派生的键。
+  // 账号一旦被移除就再也推导不出它的桶，桶里剩下的索引/元数据/分片就成了永远
+  // 找不回来的残留（内容还在服务器上）。所以这里把见过/用过的桶登记下来，
+  // 删除用户时用登记表把「不在账号表里、也没人认领」的桶一并清掉。
+  const BUCKET_REGISTRY_KEY = 'textdb_bucket_registry_v1';
+  function loadBucketRegistry() {
+    try {
+      const raw = localStorage.getItem(BUCKET_REGISTRY_KEY);
+      const list = raw ? JSON.parse(raw) : [];
+      return Array.isArray(list) ? list.filter((x) => x && typeof x.key === 'string') : [];
+    } catch (e) { return []; }
+  }
+  function saveBucketRegistry(list) {
+    try { localStorage.setItem(BUCKET_REGISTRY_KEY, JSON.stringify(list.slice(-500))); } catch (e) {}
+  }
+  function rememberBucket(key, owner) {
+    if (!key) return;
+    // 统一登记成完整的索引桶键（例如 global_file_index_..._u_abc1234），
+    // 否则「短前缀」与「完整键」混在一张表里，清理时会算错。
+    const full = String(key).indexOf(INDEX_KEY) === 0 ? String(key) : indexKeyFor(key);
+    const list = loadBucketRegistry();
+    const hit = list.find((x) => x.key === full);
+    const at = Date.now();
+    if (hit) { hit.at = at; if (owner) hit.owner = owner; }
+    else list.push({ key: full, owner: owner || '', at: at });
+    saveBucketRegistry(list);
+  }
+  /** 账号表里所有人的桶（含内置超管）；返回完整索引桶键 */
+  async function knownUserBucketKeys(users) {
+    const set = new Set();
+    try {
+      const list = users || await loadUsers();
+      for (const u of list) if (u && u.user) set.add(indexKeyFor(await userKeyOf(u.user)));
+    } catch (e) {}
+    for (const n of (typeof SUPER_ADMINS !== 'undefined' ? SUPER_ADMINS : [ADMIN_USER])) {
+      try { set.add(indexKeyFor(await userKeyOf(n))); } catch (e) {}
+    }
+    return set;
+  }
+  // ===== del-v3：按属主清理 + 并发删除 + 进度条 =====
   /**
-   * 移除用户：清空该用户的文件索引与文件元数据，并删除用户记录。
-   * 分片数据不逐个删除（服务端无删除接口），仅解除索引，释放界面占用。
+   * 并发删除一批键（自动去重）。返回 { total, ok, failed }。
+   * 原来分片是一条一条串行删的：10 MiB 数据 ≈ 1300 个 8KB 分片，
+   * 也就是 1300 多次串行请求（每次 0.3~1s）—— 用户看到的就是「卡住/删不掉」。
+   */
+  async function deleteKeys(keys, ctx, onTick) {
+    const uniq = Array.from(new Set((keys || []).filter(Boolean)));
+    const out = { total: uniq.length, ok: 0, failed: 0 };
+    if (!uniq.length) return out;
+    let done = 0;
+    const conc = Math.max(4, Math.min(concurrency(), 32));
+    await runPool(conc, uniq.length, async (i) => {
+      throwIfAborted(ctx);
+      try { await textdbDelete(uniq[i], ctx); out.ok++; }
+      catch (e) { if (e && e.aborted) throw e; out.failed++; }
+      done++;
+      if (onTick && (done % 8 === 0 || done === uniq.length)) onTick(done, uniq.length, out.failed);
+    });
+    return out;
+  }
+
+  /**
+   * 一个用户的数据**可能**存在的所有桶（返回桶后缀，不是完整键）。
+   * 不能只清「他自己派生的那个桶」：早期版本的索引是全局一张表，
+   * 条目靠 owner 字段标记归属、物理位置却在管理员的桶里 ——
+   * 只清派生桶的结果就是「账号没了、文件一个没少」，甚至永远删不掉。
+   */
+  async function candidateBucketsFor(name, users, opts = {}) {
+    const set = new Set();
+    const add = (k) => { const s = String(k == null ? '' : k); if (s) set.add(s); };
+    try { add(await userKeyOf(name)); } catch (e) {}
+    try { add(myKey()); } catch (e) {}                       // 历史全局索引的落点
+    for (const k of (opts.extraBuckets || [])) add(k);
+    if (!opts.onlyOwnBucket) {
+      try {
+        const list = users || await loadUsers();
+        for (const u of list) if (u && u.user) add(await userKeyOf(u.user));
+      } catch (e) {}
+      for (const n of (typeof SUPER_ADMINS !== 'undefined' ? SUPER_ADMINS : [ADMIN_USER])) {
+        try { add(await userKeyOf(n)); } catch (e) {}
+      }
+      // 桶登记表里出现过的桶（历史改名 / 换号留下的）
+      for (const rec of loadBucketRegistry()) {
+        const s = String((rec && rec.key) || '');
+        if (s.indexOf(INDEX_KEY) === 0 && s.length > INDEX_KEY.length + 3) add(s.slice(INDEX_KEY.length + 3));
+      }
+    }
+    return Array.from(set);
+  }
+
+  /**
+   * 第一阶段：只读扫描，算出「要摘哪些条目、要删哪些分片、多少体积」。
+   * 先规划再执行，进度条从一开始就能拿到准确总量（而不是转圈圈猜）。
+   */
+  async function planUserPurge(name, users, opts = {}, onStep) {
+    const want = String(name == null ? '' : name).trim().toLowerCase();
+    const ownKey = String(await userKeyOf(name)).toLowerCase();
+    const buckets = await candidateBucketsFor(name, users, opts);
+    const plan = { name: name, buckets: [], files: 0, chunks: 0, bytes: 0 };
+    for (let bi = 0; bi < buckets.length; bi++) {
+      throwIfAborted(opts.ctx);
+      const b = buckets[bi];
+      if (onStep) onStep('scan', bi + 1, buckets.length, b);
+      const full = indexKeyFor(b);
+      let list = [];
+      try {
+        const text = await textdbGet(full, opts.ctx);
+        list = text ? JSON.parse(text) : [];
+      } catch (e) { continue; }                              // 桶读不到就跳过
+      if (!Array.isArray(list) || !list.length) continue;
+      const own = String(b).toLowerCase() === ownKey;
+      const keep = [], targets = [];
+      for (const it of list) {
+        const o = (it && it.owner != null) ? String(it.owner).trim().toLowerCase() : '';
+        if (it && it.metaKey && (own || (want && o === want))) targets.push(it);
+        else keep.push(it);
+      }
+      if (!targets.length) continue;
+      const entryChunks = [];
+      let bytes = 0, read = 0;
+      const conc = Math.max(4, Math.min(concurrency(), 24));
+      await runPool(conc, targets.length, async (i) => {
+        const it = targets[i];
+        let cks = [];
+        try {
+          const mt = await textdbGet(it.metaKey, opts.ctx);
+          if (mt) {
+            const meta = JSON.parse(mt);
+            if (Array.isArray(meta && meta.chunkKeys)) cks = meta.chunkKeys.filter(Boolean);
+          }
+        } catch (e) { /* 元数据读不到就拿不到分片键，只能清索引条目（账如实记） */ }
+        entryChunks[i] = cks;
+        bytes += it.size || 0;
+        read++;
+        if (onStep && (read % 4 === 0 || read === targets.length)) onStep('meta', read, targets.length, b);
+      });
+      plan.buckets.push({ key: b, full: full, all: list, metas: targets.map((it) => it.metaKey), entryChunks: entryChunks, bytes: bytes });
+      plan.files += targets.length;
+      plan.chunks += entryChunks.reduce((n, a) => n + (a ? a.length : 0), 0);
+      plan.bytes += bytes;
+    }
+    return plan;
+  }
+
+  /**
+   * 第二阶段：真正执行删除。
+   * 顺序：**先删分片 → 再删元数据 → 最后写回索引**。
+   *   · 元数据只在「该文件的分片全部删掉」之后才删 —— 反过来的话，剩下的分片键就永远找不回来了；
+   *   · 索引写回放在最后，且只摘掉「确认删干净」的条目 —— 中途取消时没删完的条目原样保留
+   *     （数据和索引都还在），再删一次即可，绝不产生不可达的孤儿数据。
+   */
+  async function executePurgePlan(plan, opts = {}, onStep) {
+    const ctx = opts.ctx || null;
+    const stat = { files: 0, chunks: 0, bytes: plan.bytes, failed: 0, buckets: plan.buckets.length, writeFailed: 0, cancelled: false };
+    const conc = Math.max(4, Math.min(concurrency(), 32));
+    let aborted = false;
+    const stop = () => {
+      if (aborted) return true;
+      if (ctx && ctx.signal && ctx.signal.aborted) { aborted = true; return true; }
+      return false;
+    };
+    // --- 第一轮：删分片（全局并发，每个条目单独记账）---
+    const chunkTasks = [];
+    for (const b of plan.buckets) {
+      b.state = b.metas.map((mk, i) => ({ mk: mk, chunks: b.entryChunks[i] || [], okChunks: 0, chunkFailed: false, metaOk: false }));
+      for (const s of b.state) for (const c of s.chunks) chunkTasks.push({ s: s, key: c });
+    }
+    // 分片与元数据用**同一条**进度带按「工作量单位」推进：
+    // 分两段独立算比例的话，某一阶段任务数为 0（例如索引条目的元数据早就没了、没有分片可删）
+    // 会让进度条从 6% 直接跳到 86%，看起来像卡了一下。
+    let unit = 0;
+    const totalUnits = chunkTasks.length + plan.buckets.reduce((n, b) => n + b.metas.length, 0);
+    const bump = (label) => {
+      unit++;
+      if (onStep && (unit % 8 === 0 || unit >= totalUnits)) onStep('units', Math.min(unit, totalUnits), totalUnits, label);
+    };
+    await runPool(conc, chunkTasks.length, async (i) => {
+      if (stop()) return;
+      const t = chunkTasks[i];
+      try { await textdbDelete(t.key, ctx); t.s.okChunks++; stat.chunks++; }
+      catch (e) { if (e && e.aborted) { aborted = true; return; } t.s.chunkFailed = true; stat.failed++; }
+      bump('删除数据分片');
+    });
+    // --- 第二轮：只给「分片全删干净」的条目删元数据（分片失败/取消的条目保持完整，便于再删一次）---
+    const metaTasks = [];
+    for (const b of plan.buckets) for (const s of (b.state || [])) {
+      if (!s.chunkFailed && s.okChunks === s.chunks.length) metaTasks.push(s);
+    }
+    await runPool(conc, metaTasks.length, async (i) => {
+      if (stop()) return;
+      const s = metaTasks[i];
+      try { await textdbDelete(s.mk, ctx); s.metaOk = true; stat.files++; }
+      catch (e) { if (e && e.aborted) { aborted = true; return; } stat.failed++; }
+      bump('删除文件记录');
+      try { metaCache.delete(s.mk); revokeCachedBlob(s.mk); } catch (e) {}
+    });
+    // --- 第三轮：写回索引（只摘掉确认删干净的条目）---
+    for (const b of plan.buckets) {
+      const gone = new Set();
+      for (const s of (b.state || [])) if (s.metaOk) gone.add(s.mk);
+      if (!b.all || !gone.size) continue;                        // 什么都没删掉就不写
+      const keep = [];
+      for (const it of b.all) {
+        if (it && it.metaKey && gone.has(it.metaKey)) continue;
+        keep.push(it);
+      }
+      if (keep.length === b.all.length) continue;
+      try {
+        const text = JSON.stringify(keep);
+        if (text.length + b.full.length + API_BASE.length + 32 > MAX_URL_LEN) {
+          stat.writeFailed++;
+          log('⚠️ 桶写回后仍超出单条上限，已跳过（数据已删、索引未更新）：' + b.full);
+          continue;
+        }
+        await textdbUpdate(b.full, text, false, ctx);
+      } catch (e) {
+        if (e && e.aborted) { aborted = true; continue; }
+        stat.writeFailed++;
+        log('⚠️ 索引写回失败：' + b.full + ' — ' + (e && e.message));
+      }
+      if (onStep) onStep('write', 1, 1, '');
+    }
+    stat.cancelled = aborted;
+    return stat;
+  }
+
+  /** 把「扫描 / 读元数据 / 删分片 / 删记录 / 写回索引」映射成一条 0→100% 的进度 */
+  function makePurgeProgress(name) {
+    const PH = { scan: [0, 0.05], meta: [0.05, 0.18], units: [0.18, 0.96], write: [0.96, 1], orphan: [0.96, 1] };
+    let lastPct = -1, lastNote = '';
+    const view = {
+      begin() {
+        try { progressUI.begin('正在移除用户「' + name + '」', false); } catch (e) {}
+        view.phase('正在扫描索引…');
+      },
+      phase(label) {
+        try { progressUI.setPhaseLabel(label); } catch (e) {}
+      },
+      step(phase, done, total, label, failed) {
+        const w = PH[phase] || [0, 1];
+        const r = total > 0 ? Math.min(1, done / total) : 1;
+        const ratio = w[0] + (w[1] - w[0]) * r;
+        const p = Math.floor(ratio * 100);
+        let note = '';
+        if (phase === 'scan') note = '扫描数据桶 ' + done + '/' + total + (label ? ' · ' + label : '');
+        else if (phase === 'meta') note = '读取文件信息 ' + done + '/' + total;
+        else if (phase === 'units') note = (label || '删除数据') + ' ' + done + '/' + total;
+        else if (phase === 'orphan') note = label || ('历史残留桶 ' + done + '/' + total);
+        else note = '写回索引…';
+        if (failed) note += ' · 失败 ' + failed;
+        if (p === lastPct && note === lastNote) return;
+        lastPct = p; lastNote = note;
+        try { progressUI.set(ratio, null, null, note, true); } catch (e) {}
+      },
+      done(msg) { try { progressUI.done(msg); } catch (e) {} },
+      fail(msg) { try { progressUI.fail(msg); } catch (e) {} }
+    };
+    return view;
+  }
+
+  /**
+   * 清理孤儿桶：登记过的桶里，既不属于任何现有账号、也不属于内置超管的，
+   * 说明是历史改名 / 换号 / 删除用户留下的残留（云端没有列举接口，只能靠登记表回收）。
+   */
+  let orphanSweeping = false;
+  async function sweepOrphanBuckets() {
+    if (orphanSweeping || !canManage()) return { cleared: 0 };
+    orphanSweeping = true;
+    let cleared = 0;
+    try {
+      const users = await loadUsers();
+      const alive = await knownUserBucketKeys(users);
+      const reg = loadBucketRegistry();
+      const kept = [];
+      for (const rec of reg) {
+        if (alive.has(rec.key)) { kept.push(rec); continue; }
+        await clearBucket(rec.key);
+        cleared++;
+      }
+      saveBucketRegistry(kept);
+    } catch (e) { /* 清理失败不影响使用 */ }
+    finally { orphanSweeping = false; }
+    return { cleared: cleared };
+  }
+
+  /** 清空一个桶（索引 + 文件夹索引）；可顺便删掉索引里记录的文件元数据与分片（并发） */  async function clearBucket(key, purgeFiles, opts = {}) {
+    if (!key) return { files: 0, chunks: 0, cleared: false };
+    const full = String(key).indexOf(INDEX_KEY) === 0 ? String(key) : indexKeyFor(key);
+    const prefix = full.slice(full.lastIndexOf('_u_') + 3);
+    const out = { files: 0, chunks: 0, cleared: false, failed: 0 };
+    if (purgeFiles) {
+      try {
+        const text = await textdbGet(full, opts.ctx);
+        const list = text ? JSON.parse(text) : [];
+        if (Array.isArray(list)) {
+          const metaKeys = [], chunkKeys = [];
+          for (const it of list) {
+            if (!it || !it.metaKey) continue;
+            metaKeys.push(it.metaKey);
+            try {
+              const mt = await textdbGet(it.metaKey, opts.ctx);
+              if (mt) {
+                const meta = JSON.parse(mt);
+                if (Array.isArray(meta && meta.chunkKeys)) for (const c of meta.chunkKeys) { if (c) chunkKeys.push(c); }
+              }
+            } catch (e) {}
+            metaCache.delete(it.metaKey);
+            revokeCachedBlob(it.metaKey);
+          }
+          const dc = await deleteKeys(chunkKeys, opts.ctx);
+          const dm = await deleteKeys(metaKeys, opts.ctx);
+          out.chunks += dc.total;
+          out.files += dm.total;
+          out.failed += dc.failed + dm.failed;
+        }
+      } catch (e) {}
+    }
+    // 清空索引桶。注意：键长受服务端 60 字符限制，超长的桶写不进去 —— 这类
+    // 桶只存在于历史数据里，此时至少把能写的那一半（文件夹桶）清掉并如实回报。
+    try {
+      await textdbUpdate(full, JSON.stringify([]), false, opts.ctx);
+      out.cleared = true;
+    } catch (e) {
+      out.clearError = e && e.message;
+      try { await textdbUpdate(FOLDER_KEY + '_u_' + prefix, JSON.stringify([]), false, opts.ctx); } catch (e2) {}
+    }
+    if (out.cleared) {
+      try { await textdbUpdate(FOLDER_KEY + '_u_' + prefix, JSON.stringify([]), false, opts.ctx); } catch (e) {}
+    }
+    return out;
+  }
+  /** 会员文件夹索引 + 由索引推导出的目录，重新算一份（用于删人后彻底刷新目录，不再残留旧成员目录） */
+  async function reloadFolderCache() {
+    if (canManage() && session.adminUserFilter) {
+      const rec = session.memberFolderCache;
+      if (rec && rec.owner === memberFolderCacheKey(session.adminUserFilter)) return rec.folders || [];
+    }
+    let base = [];
+    try {
+      const text = await textdbGet(folderKeyFor(myKey()));
+      const list = text ? JSON.parse(text) : [];
+      base = normalizeFolders(list);
+    } catch (e) { base = []; }
+    DataStore.folders = base;
+    syncFolderCacheFromIndex();          // 并从「当前账号的」索引里补齐目录
+    return DataStore.folders;
+  }
+
+  /**
+  /**
+   * 清除某个用户的所有云端数据。
+   * 与旧实现的关键差别：不再只清「他自己派生的那个桶」，而是把所有可能存放
+   * 他数据的桶都扫一遍、按 owner 判定归属 —— 否则就会遇到
+   * 「账号已经删了、文件一个没少」或者「干脆不是账号，于是永远删不掉」的历史残留。
+   */
+  async function purgeUserData(name, users, opts = {}) {
+    const view = opts.progress || makePurgeProgress(name);
+    view.begin();
+    let stat = { files: 0, chunks: 0, bytes: 0, failed: 0, orphanBuckets: 0, buckets: 0, writeFailed: 0, planned: 0, cancelled: false };
+    let plan = { buckets: [], files: 0, chunks: 0, bytes: 0 };
+    try {
+      plan = await planUserPurge(name, users, opts, (phase, done, total, label) => view.step(phase, done, total, label));
+      stat.planned = plan.files;
+      if (!plan.buckets.length) log('ℹ️ 没有找到属于 ' + name + ' 的索引条目（可能本来就没有数据）');
+      view.phase('正在清除 ' + name + ' 的数据…');
+      const main = await executePurgePlan(plan, opts, (phase, done, total, label, failed) => view.step(phase, done, total, label, failed));
+      stat.files = main.files; stat.chunks = main.chunks; stat.bytes = main.bytes;
+      stat.failed += main.failed; stat.buckets = main.buckets; stat.writeFailed = main.writeFailed;
+      stat.cancelled = !!main.cancelled;
+      // 他自己的文件夹桶也要一起清：索引摘干净了、文件夹索引还留着的话，
+      // 管理端切进这个用户（或他自己登录）时导航窗格里还会冒出空目录。
+      try {
+        const ownFolderKey = folderKeyFor(await userKeyOf(name));
+        const cur = await textdbGet(ownFolderKey, opts.ctx);
+        if (cur && cur !== '[]') await textdbUpdate(ownFolderKey, JSON.stringify([]), false, opts.ctx);
+      } catch (e) { log('⚠️ 文件夹索引清理失败：' + (e && e.message)); }
+    } catch (e) {
+      if (e && e.aborted) throw e;
+      view.fail('移除失败：' + (e && e.message));
+      throw e;
+    }
+    // 孤儿桶：登记表里记录过、但现在不属于任何账号的桶（历史改名/换号留下的）
+    if (!opts.keepOrphans) {
+      try {
+        const alive = await knownUserBucketKeys(users);
+        const reg = loadBucketRegistry();
+        const handled = new Set(plan.buckets.map((b) => b.full));
+        const rest = reg.filter((rec) => !alive.has(rec.key) && !handled.has(rec.key));
+        for (let i = 0; i < rest.length; i++) {
+          if (opts.ctx && opts.ctx.signal && opts.ctx.signal.aborted) break;   // 已取消：剩下的孤儿桶留到下次
+          view.step('orphan', i + 1, rest.length, '历史残留桶 ' + (i + 1) + '/' + rest.length);
+          const r = await clearBucket(rest[i].key, true, { ctx: opts.ctx });
+          stat.orphanBuckets++;
+          stat.files += r.files; stat.chunks += r.chunks; stat.failed += r.failed || 0;
+          if (r.clearError) { stat.failed++; log('⚠️ 历史残留桶未能完全清空（' + r.clearError + '）'); }
+        }
+      } catch (e) {
+        if (e && e.aborted) throw e;
+        log('⚠️ 历史残留桶清理失败（不影响主流程）：' + (e && e.message));
+      }
+    }
+    return stat;
+  }
+
+  /**
+   * 移除用户：删除账号，并把它的文件数据一并清干净。
+   * 三个保证：
+   *   1) 账号表写失败直接抛错（绝不静默成功），这一步在删文件之前；
+   *   2) 无论账号表里有没有这条记录，都去清他的数据 —— 历史残留只有索引没有账号；
+   *   3) 全程一条进度条，可取消（取消后已摘的索引不回滚，但不会留下坏文件）。
    */
   async function removeUser(username, opts = {}) {
     const name = String(username || '').trim();
     if (!name) throw new Error('用户名无效');
-    if (isPrimaryAdmin(name)) throw new Error(name + ' 是超级管理员账号，不能移除');
-    // 非超级管理员不能移除其他管理员：需要超级管理员先收回其管理权
-    if (!canGrantAdmin() && userIsManager(name)) throw new Error('对方也是管理员，只有超级管理员能移除管理员');
+    if (isPrimaryAdmin(name)) throw new Error('不能移除总管理员账号');
+    // 管理员（除 wlh 外）不能移除其他管理员：需要 wlh 先收回其管理权
+    if (!isPrimaryAdmin() && userIsManager(name)) throw new Error('对方也是管理员，只有 wlh 能移除管理员');
     if (canManage() && String(name).toLowerCase() === String(session.user || '').toLowerCase()) {
       throw new Error('不能移除自己');
     }
-    const users = await loadUsers();
-    const rec = findUser(users, name);
-    const key = rec ? await userKeyOf(rec.user) : await userKeyOf(name);
-    let fileCount = 0, freedBytes = 0;
+    const view = opts.progress || makePurgeProgress(name);
+    const ctrl = new AbortController();
+    const ctx = { signal: ctrl.signal };
+    const prevAbort = busyAbort;
+    busyAbort = ctrl;
+    isPurging = true;
+    view.begin();
     try {
-      const text = await textdbGet(indexKeyFor(key));
-      const list = text ? JSON.parse(text) : [];
-      if (Array.isArray(list)) {
-        for (const it of list) {
-          if (!it || !it.metaKey) continue;
-          if (opts.keepFiles) continue;
-          try { await textdbDelete(it.metaKey); } catch (e) {}
-          metaCache.delete(it.metaKey);
-          fileCount++; freedBytes += it.size || 0;
-        }
+      const users = await loadUsers();
+      const rec = findUser(users, name);
+      const next = users.filter(u => String(u.user).toLowerCase() !== name.toLowerCase());
+      // 1) 先删账号记录：这一步失败就整体失败，不会出现「账号还在、文件没了」
+      if (rec) {
+        view.phase('正在移除账号记录…');
+        await saveUsers(next);
+      } else {
+        log('ℹ️ 账号表里没有 ' + name + ' 的记录，直接清理它的残留文件数据');
       }
-      // 清空索引
-      await textdbUpdate(indexKeyFor(key), JSON.stringify([]), false);
-      await textdbUpdate(folderKeyFor(key), JSON.stringify([]), false);
-    } catch (e) { log('⚠️ 清理该用户数据时出错：' + e.message); }
-    const next = users.filter(u => String(u.user).toLowerCase() !== name.toLowerCase());
-    await saveUsers(next);
-    managerFlags.delete(name.toLowerCase());
-    if (session.adminUserFilter && String(session.adminUserFilter).toLowerCase() === name.toLowerCase()) {
-      session.adminUserFilter = null;
+      managerFlags.delete(name.toLowerCase());
+      if (session.adminUserFilter && String(session.adminUserFilter).toLowerCase() === name.toLowerCase()) {
+        session.adminUserFilter = null;
+      }
+      // 登记这个用户的桶：即使此刻云端还没有数据，将来改名/删除时也能凭登记表找回
+      rememberBucket(indexKeyFor(await userKeyOf(name)), name);
+      // 2) 再清文件数据（所有可能存放他数据的桶都扫）
+      let stat = { files: 0, chunks: 0, bytes: 0, failed: 0, orphanBuckets: 0, buckets: 0, writeFailed: 0 };
+      if (!opts.keepFiles) {
+        stat = await purgeUserData(name, next, Object.assign({}, opts, { ctx: ctx, progress: view }));
+      }
+      // 3) 清掉这个人的文件夹缓存 + 从「更新后的账号表」重算目录集合
+      await pruneMemberFolderCaches(next);
+      try { await reloadFolderCache(); } catch (e) {}
+      invalidateFolderIndex();
+      invalidateRenderSignature();
+      try { window.renderFileList(); } catch (e) {}
+      const summary = '已移除 ' + name + '：文件 ' + stat.files + ' 个 · 分片 ' + stat.chunks + ' 个'
+        + (stat.bytes ? ' · ' + formatSize(stat.bytes) : '')
+        + (stat.orphanBuckets ? ' · 历史残留桶 ' + stat.orphanBuckets + ' 个' : '')
+        + (stat.failed ? ' · ' + stat.failed + ' 项未删除' : '');
+      if (stat.cancelled) {
+        view.fail('已取消：' + name + ' 的数据没删完');
+        log('⛔ 已取消移除 ' + name + '：已完成 ' + summary.replace('已移除 ' + name + '：', '')
+          + '；没删完的条目原样保留，再执行一次即可继续');
+      } else {
+        view.done('✅ ' + summary);
+        log('🗑️ ' + summary);
+      }
+      return {
+        user: name, fileCount: stat.files, freedBytes: stat.bytes,
+        chunks: stat.chunks, orphanBuckets: stat.orphanBuckets, failed: stat.failed,
+        buckets: stat.buckets, accountFound: !!rec, removed: users.length - next.length,
+        cancelled: !!stat.cancelled
+      };
+    } catch (e) {
+      if (e && e.aborted) view.fail('已取消：移除用户「' + name + '」');
+      else view.fail('移除失败：' + (e && e.message));
+      throw e;
+    } finally {
+      isPurging = false;
+      busyAbort = prevAbort;
     }
-    return { user: name, fileCount, freedBytes, removed: users.length - next.length };
   }
+  /** 清掉「已不存在账号」的文件夹缓存：删人后界面/派生数据里不能还留着这些目录 */
+  async function pruneMemberFolderCaches(users) {
+    try {
+      const list = users || await loadUsers();
+      const alive = new Set(list.filter((u) => u && u.user).map((u) => String(u.user).toLowerCase()));
+      for (const n of (typeof SUPER_ADMINS !== 'undefined' ? SUPER_ADMINS : [ADMIN_USER])) alive.add(String(n).toLowerCase());
+      for (const key of Array.from(memberFolders.keys())) {
+        if (!alive.has(key)) memberFolders.delete(key);
+      }
+      if (session.adminUserFilter && !alive.has(String(session.adminUserFilter).toLowerCase())) {
+        session.adminUserFilter = null;
+      }
+      prefetchSeq++;                       // 作废在途预取结果
+      invalidateNavpane();
+      invalidateDesktop();
+      bumpDataContext();                   // 派生缓存（目录索引/列表签名/成员行）一起失效
+      try { window.renderFileList(); } catch (e) {}
+    } catch (e) { /* 缓存清理失败不影响主流程 */ }
+  }
+
   async function saveUsers(list) {
     await textdbUpdate(USERS_KEY, JSON.stringify(list), false);
     return list;
@@ -4385,6 +4858,10 @@
     searchQuery = '';
     await refreshAll();
     log(`✅ 已登录：${session.user}${session.isAdmin ? '（管理员：可查看与删除所有人的文件）' : ''}`);
+    // 登录后回收一次孤儿桶（历史改名 / 换号 / 删除用户留下的索引残留）
+    if (canManage()) {
+      setTimeout(() => { try { sweepOrphanBuckets(); } catch (e) {} }, 800);
+    }
   }
   function showAuthGate(msg) {
     const app = document.getElementById('appMain');
@@ -4894,7 +5371,7 @@
     if (!busyAbort && !runningPool) { log('当前没有进行中的任务'); return; }
     if (runningPool && typeof runningPool.catch === 'function') runningPool.catch(() => {});
     if (busyAbort) busyAbort.abort();
-    const which = isUploading ? '上传' : (isDownloading ? '下载' : '任务');
+    const which = isPurging ? '删除' : (isUploading ? '上传' : (isDownloading ? '下载' : '任务'));
     log('⛔ 正在取消' + which + '…');
     progressUI.setPhaseLabel('正在取消' + which + '…');
   }
@@ -6785,6 +7262,11 @@
   window.__dbgIndex = () => activeIndex();
   window.__dbgAllIndex = () => DataStore.index.filter(item => item && item.metaKey);   // 未按用户过滤
   window.__removeUser = (name, opts) => removeUser(name, opts);
+  window.__sweepOrphans = () => sweepOrphanBuckets();
+  window.__bucketRegistry = () => loadBucketRegistry();
+  window.__rememberBucket = (k, owner) => rememberBucket(k, owner);
+  window.__clearMemberFolders = () => { memberFolders.clear(); prefetchSeq++; bumpDataContext(); };
+  window.__pruneMemberFolders = (users) => pruneMemberFolderCaches(users);
   window.__loadUsers = () => loadUsers();
   window.__setUserFilter = (v) => { session.adminUserFilter = v || null; bumpDataContext(); };
   window.__dbgUserFilter = () => session.adminUserFilter || null;
@@ -8059,31 +8541,87 @@
   }
 
   /** 管理员移除用户（清空其索引与文件记录，并删除账号） */
+  /** 管理员移除用户（删除账号 + 清空其文件数据） */
   async function confirmRemoveUser(user) {
     if (!V().canManage) { B.showToast('只有管理员可以移除用户'); return; }
-    if (isPrimaryAdmin(user)) { B.showToast(user + ' 是超级管理员账号，不能移除'); return; }
-    if (!canGrantAdmin() && userIsManager(user)) { B.showToast('对方也是管理员，只有超级管理员能移除管理员'); return; }
-    let count = 0;
+    const name = String(user || '');
+    if (isPrimaryAdmin(name)) { B.showToast(name + ' 是超级管理员账号，不能移除'); return; }
+    if (!canGrantAdmin() && userIsManager(name)) { B.showToast('对方也是管理员，只有超级管理员能移除管理员'); return; }
+    if (name.toLowerCase() === String(V().user || '').toLowerCase()) { B.showToast('不能移除自己'); return; }
+    let count = 0, bytes = 0;
     try {
-      count = (V().allIndex || []).filter((it) => String(it.owner || '').toLowerCase() === String(user).toLowerCase()).length;
+      (V().allIndex || []).forEach((it) => {
+        if (String(it.owner || '').toLowerCase() !== name.toLowerCase()) return;
+        count++; bytes += it.size || 0;
+      });
     } catch (e) {}
-    const msg = '确定要移除用户「' + user + '」吗？\n\n这会删除该账号，并清除其 ' + count + ' 个文件的索引与元数据（不可撤销）。';
+    const msg = '确定要移除用户「' + name + '」吗？\n\n'
+      + (count ? ('将删除该账号，并清除它的 ' + count + ' 个文件' + (bytes ? '（' + sizeText(bytes) + '）' : ''))
+               : '账号表里似乎没有这个用户，将只清理它的残留文件数据')
+      + '：索引、文件元数据与分片都会删除，不可撤销。\n\n'
+      + '删除过程会在右下角显示进度，中途可以取消。';
     let ok = false;
     if (typeof window.__confirmDelete === 'function') ok = await window.__confirmDelete(msg);
     if (!ok) return;
     try {
-      const res = await window.__removeUser(user);
-      log('🗑️ 已移除用户 ' + user + '（清理 ' + (res.fileCount || 0) + ' 个文件）');
-      B.showToast('已移除用户 ' + user + '（清理 ' + (res.fileCount || 0) + ' 个文件）', 3200);
-      if (state.adminUserFilter === user) await setUserFilter(null);
-      else { await B.refreshAll(); invalidateNavpane(); markShell(DIRTY_STATUS | DIRTY_DESKTOP); }
+      const res = await window.__removeUser(name);
+      const n = res.fileCount || 0;
+      const ch = res.chunks || 0;
+      const orph = res.orphanBuckets || 0;
+      const failed = res.failed || 0;
+      const summary = '已移除用户 ' + name
+        + '（文件 ' + n + ' 个'
+        + (ch ? ' · 分片 ' + ch + ' 个' : '')
+        + (orph ? ' · 顺带清理历史残留桶 ' + orph + ' 个' : '')
+        + (failed ? ' · ' + failed + ' 项未能删除' : '')
+        + '）';
+      log('🗑️ ' + summary);
+      // 不管账号表里有没有这条记录，都必须重算成员名单：
+      // 历史残留可能只有索引条目、没有账号记录，不刷新的话它会一直挂在桌面上（就是「删不掉」的观感）。
+      await refreshAfterUserChange();
+      if (res.cancelled) {
+        B.showToast('⛔ 已取消移除 ' + name + '：没删完的部分已原样保留，再执行一次即可继续', 4200);
+      } else {
+        B.showToast(summary, 3600);
+      }
+      if (!res.accountFound) {
+        log('ℹ️ 账号表里本来就没有 ' + name + '，这次清理的是它的残留文件数据');
+      }
     } catch (e) {
-      log('❌ 移除用户失败：' + (e && e.message));
-      B.showToast('移除失败：' + (e && e.message), 3200);
+      if (e && e.aborted) {
+        log('⛔ 已取消移除用户 ' + name + '（没删完的条目原样保留，再执行一次即可继续）');
+        B.showToast('已取消移除 ' + name, 2600);
+        try { await refreshAfterUserChange(); } catch (e2) {}
+      } else {
+        log('❌ 移除用户失败：' + (e && e.message));
+        B.showToast('移除失败：' + (e && e.message), 3600);
+      }
     }
   }
-
-  // ---------------------------------------------------------------- 账号管理（仅超级管理员）
+  /** 用户集合变化后，把所有跟「有哪些人」「有哪些目录」有关的界面一次刷干净 */
+  async function refreshAfterUserChange() {
+    if (state.adminUserFilter) {
+      // 别停在已经不存在的成员视图里
+      try { exitUser(); } catch (e) {}
+    }
+    session_memberFoldersClear();
+    try { await window.__pruneMemberFolders(); } catch (e) {}     // 清掉已删账号的目录缓存
+    memberRowsSig = '';
+    // 重新拉索引：必须先做这一步——目录缓存是从「当前索引」推导的，
+    // 索引里还留着被删用户的文件时，他的目录会被重新推导回来。
+    try { await loadIndex(); } catch (e) {}
+    try { await loadFolders(); } catch (e) {}
+    if (typeof reloadFolderCache === 'function') { try { await reloadFolderCache(); } catch (e) {} }
+    invalidateNavpane();
+    invalidateDesktop();
+    markShell(DIRTY_STATUS | DIRTY_DESKTOP | DIRTY_ADDR | DIRTY_START | DIRTY_CMD);
+    forceRenderFileList();
+    try { window.renderFileList(); } catch (e) {}
+  }
+  function session_memberFoldersClear() {
+    try { if (window.__clearMemberFolders) window.__clearMemberFolders(); } catch (e) {}
+  }
+    // ---------------------------------------------------------------- 账号管理（仅超级管理员）
   /** 界面统一的账号刷新：重画成员行 / 导航窗格 / 桌面图标 */
   function refreshAccountViews() {
     invalidateNavpane();
